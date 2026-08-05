@@ -1,14 +1,16 @@
-# Зависимости Node.js
+# Node.js dependencies
 node_modules/
-package-lock.json
-yarn.lock
 
-# Данные сессии и кэш
+# Runtime data and caches
 session/
 .cache/
+uploads/
+tmp/
+temp/
+*.tmp
 
 
-# Служебные файлы
+# Local configuration
 .DS_Store
 .env
 .env.local
@@ -16,14 +18,14 @@ session/
 .env.test.local
 .env.production.local
 
-# Логи
-logs
+# Logs
+logs/
 *.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# Файлы Python
+# Python files
 __pycache__/
 *.py[cod]
 *$py.class
@@ -32,7 +34,7 @@ venv/
 .env/
 .venv/
 
-# Файлы редакторов
+# Editors
 .idea/
 .vscode/
 *.swp
