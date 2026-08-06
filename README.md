@@ -4,7 +4,7 @@ Local Node.js API proxy for Qwen Chat based on browser automation. It exposes Op
 
 This is not an official Alibaba or Qwen API and does not run a local model. It depends on Qwen Chat's internal web interfaces, which may change without notice.
 
-## Возможности
+## Features
 
 - OpenAI-compatible chat completions with streaming support
 - Model listing and model metadata synchronization
@@ -14,7 +14,7 @@ This is not an official Alibaba or Qwen API and does not run a local model. It d
 - Open WebUI, LiteLLM, and OpenAI SDK integration examples
 - Health, status, and smoke-test endpoints
 
-## Стек
+## Stack
 
 - Node.js with ES modules
 - Express
@@ -23,7 +23,7 @@ This is not an official Alibaba or Qwen API and does not run a local model. It d
 - Winston and Morgan
 - Docker and Docker Compose
 
-## Быстрый старт
+## Quick start
 
 Node.js 18 or newer is recommended. Install dependencies and create a Qwen Chat session:
 
@@ -65,9 +65,9 @@ npm run auth
 docker compose up --build -d
 ```
 
-Additional integration and media endpoint documentation is available in `docs/` and `IMAGE_VIDEO_GENERATION_GUIDE.md`.
+Additional integration documentation is available in `docs/`.
 
-## Структура проекта
+## Project structure
 
 - `index.js` — service entry point
 - `src/api/` — API routes, chat, file, and media handlers
@@ -79,6 +79,6 @@ Additional integration and media endpoint documentation is available in `docs/` 
 - `docs/` — endpoint and integration documentation
 - `session/` — local account data created at runtime and excluded from Git
 
-## Лицензия
+## License
 
 MIT
