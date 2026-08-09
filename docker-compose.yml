@@ -8,10 +8,69 @@ services:
       - PORT=${PORT:-3264}
       - HOST=0.0.0.0
       - SKIP_ACCOUNT_MENU=true
+      - NON_INTERACTIVE=true
+      # Безопасность: без непустого src/Authorization.txt сервер не стартует.
+      # Создайте файл на хосте (один ключ — одна строка), иначе контейнер
+      # будет перезапускаться с ошибкой.
+      - REQUIRE_API_KEYS=true
     ports:
       - "${PORT:-3264}:3264"
     volumes:
       - ./session:/app/session
       - ./logs:/app/logs
       - ./uploads:/app/uploads
+      # API-ключи прокси: редактируйте на хосте и делайте docker compose restart.
+      # ВАЖНО: файл должен существовать ДО первого запуска (docker создаст
+      # директорию вместо файла, если путь отсутствует).
+      - ./src/Authorization.txt:/app/src/Authorization.txt:ro
+    # Метка для autoheal: перезапускается только то, что помечено.
+    labels:
+      - "autoheal=true"
     restart: unless-stopped
+    # docker-init: переиспользует зомби-процессы (Chromium порождает дочерние).
+    init: true
+    # Даём время на graceful shutdown (закрытие браузера, сохранение сессий).
+    stop_grace_period: 30s
+    healthcheck:
+      # node:20-slim не содержит curl — используем встроенный fetch Node 20.
+      # /api/health публичный (не требует API-ключа) и отвечает ok:true только
+      # когда есть хотя бы один доступный аккаунт Qwen.
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3264/api/health').then(r => r.json()).then(j => { if (!j.ok) process.exit(1); }).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    # Лимиты ресурсов: Chromium любит память, но 24/7-прокси не должен
+    # съедать весь хост. Память 2G хватает на pool из 3 страниц.
+    mem_limit: 2g
+    cpus: "2.0"
+    pids_limit: 256
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    security_opt:
+      - no-new-privileges:true
+
+  # ── Авто-восстановление: перезапуск qwen-proxy при unhealthy ───────────────
+  # healthcheck сам по себе только показывает статус — перезапуском занимается
+  # этот watch-контейнер (willfarrell/autoheal). Он следит за Docker-событиями и
+  # рестартует КОНТЕЙНЕРЫ ТОЛЬКО С МЕТКОЙ autoheal=true (наш qwen-proxy).
+  #
+  # ВНИМАНИЕ: требует доступа к docker-сокету хоста (для этого контейнера это
+  # root-эквивалент). Из-за этого он изолирован (network_mode: none) и ограничен
+  # меткой. Если не хотите давать доступ к сокету — удалите этот сервис.
+  autoheal:
+    image: willfarrell/autoheal:1.1.0
+    container_name: qwen-proxy-autoheal
+    restart: unless-stopped
+    network_mode: none
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=autoheal
+      - AUTOHEAL_INTERVAL=10
+      # Не трогать контейнеры в первые 60с после старта (совпадает с start_period healthcheck'а).
+      - AUTOHEAL_START_PERIOD=60
+      # Совпадает с stop_grace_period qwen-proxy (30с): даём время на graceful shutdown.
+      - AUTOHEAL_DEFAULT_STOP_TIMEOUT=30
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock

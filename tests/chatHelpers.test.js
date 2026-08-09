@@ -6,7 +6,6 @@ import { fileURLToPath } from 'node:url';
 
 import {
   buildQwenCompletionUrl,
-  buildQwenRequestHeaders,
   createBrowserTokenCooldown,
   getBrowserFetchCredentials,
   getManagedAccountId,
@@ -15,6 +14,7 @@ import {
   isQwenAntiBotBody,
   shouldReturnNodeStreamingResponse
 } from '../src/api/chat.js';
+import { buildQwenRequestHeaders } from '../src/api/qwenPing.js';
 
 test('buildQwenCompletionUrl appends chat_id query required by current Qwen API', () => {
   const url = buildQwenCompletionUrl('https://chat.qwen.ai/api/v2/chat/completions', 'chat-123');
@@ -36,11 +36,13 @@ test('buildQwenRequestHeaders includes current web headers expected by Qwen', ()
   assert.ok(headers.Timezone.includes('GMT'));
 });
 
-test('managed bearer requests omit the shared browser cookie jar', () => {
-  assert.equal(getBrowserFetchCredentials('account-a'), 'omit');
-  assert.equal(getBrowserFetchCredentials(getManagedAccountId('browser:managed-account')), 'omit');
+test('browser-context requests send session cookies (WAF requires them)', () => {
+  // Запросы идут из страниц chat.qwen.ai: 'same-origin' отправляет cookies
+  // сессии, без которых WAF Qwen блокирует API (FAIL_SYS_USER_VALIDATE).
+  assert.equal(getBrowserFetchCredentials('account-a'), 'same-origin');
+  assert.equal(getBrowserFetchCredentials(getManagedAccountId('browser:managed-account')), 'same-origin');
   assert.equal(getBrowserFetchCredentials('browser:token-fingerprint'), 'same-origin');
-  assert.equal(getBrowserFetchCredentials(null), 'omit');
+  assert.equal(getBrowserFetchCredentials(null), 'same-origin');
 });
 
 test('browser token cooldown expires and does not follow a refreshed token', () => {

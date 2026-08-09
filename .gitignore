@@ -6,6 +6,11 @@ yarn.lock
 # Данные сессии и кэш
 session/
 .cache/
+uploads/
+
+# Локальные данные агентов/инструментов
+.freebuff/
+.opencode/
 
 
 # Служебные файлы

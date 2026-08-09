@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { logError } from '../logger/index.js';
-import { SESSION_DIR, ACCOUNTS_DIR } from '../config.js';
+import { SESSION_DIR, ACCOUNTS_DIR, ACCOUNT_SUBSET, RATE_LIMIT_DEFAULT_HOURS } from '../config.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -16,6 +16,50 @@ function isAvailableToken(token, now = Date.now()) {
     return Boolean(token?.token)
         && token.invalid !== true
         && (!token.resetAt || new Date(token.resetAt).getTime() <= now);
+}
+
+// FNV-1a (32 бита): стабильный, детерминированный хэш id аккаунта.
+// Используется для авто-распределения аккаунтов между воркерами: один и тот же
+// аккаунт всегда попадает в одну и ту же долю, добавление/удаление аккаунтов
+// не «перетасовывает» остальные.
+export function fnv1a(str) {
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < str.length; i++) {
+        hash ^= str.charCodeAt(i);
+        hash = Math.imul(hash, 0x01000193);
+    }
+    return hash >>> 0;
+}
+
+/**
+ * Чистая функция: назначен ли аккаунт этому инстансу?
+ *
+ * @param {string} accountId — id аккаунта (например 'acc_...')
+ * @param {string} [subset]  — формат подмножества:
+ *   ''      — все аккаунты;
+ *   'k/n'   — k-я доля из n воркеров (fnv1a(id) % n === k);
+ *   'a,b,c' — явный список id.
+ */
+export function accountBelongsToSubset(accountId, subset = ACCOUNT_SUBSET) {
+    if (!subset) return true;
+    const shard = subset.match(/^(\d+)\s*\/\s*(\d+)$/);
+    if (shard) {
+        const k = Number(shard[1]);
+        const n = Number(shard[2]);
+        if (n > 1 && k >= 0 && k < n) {
+            return fnv1a(String(accountId)) % n === k;
+        }
+        return true; // некорректный формат — не фильтруем
+    }
+    const ids = subset.split(',').map(s => s.trim()).filter(Boolean);
+    if (!ids.length) return true;
+    return ids.includes(accountId);
+}
+
+// Фильтр только для чтения аккаунтов: запись (markInvalid/markRateLimited/...)
+// работает по полному реестру — файл общий, и воркер может пометить любой аккаунт.
+function filterForInstance(tokens) {
+    return tokens.filter(t => t && t.id && accountBelongsToSubset(t.id));
 }
 
 function ensureSessionDir() {
@@ -44,7 +88,7 @@ export function saveTokens(tokens) {
 }
 
 export async function getAvailableToken() {
-    const tokens = loadTokens();
+    const tokens = filterForInstance(loadTokens());
     const now = Date.now();
     const valid = tokens.filter(token => isAvailableToken(token, now));
     if (!valid.length) return null;
@@ -55,17 +99,17 @@ export async function getAvailableToken() {
 
 export function getAvailableTokenById(id) {
     if (!id) return null;
-    const token = loadTokens().find(candidate => candidate.id === id);
+    const token = filterForInstance(loadTokens()).find(candidate => candidate.id === id);
     return isAvailableToken(token) ? token : null;
 }
 
 export function hasValidTokens() {
-    const tokens = loadTokens();
+    const tokens = filterForInstance(loadTokens());
     const now = Date.now();
     return tokens.some(token => isAvailableToken(token, now));
 }
 
-export function markRateLimited(id, hours = 24) {
+export function markRateLimited(id, hours = RATE_LIMIT_DEFAULT_HOURS) {
     const tokens = loadTokens();
     const idx = tokens.findIndex(t => t.id === id);
     if (idx !== -1) {
@@ -74,7 +118,7 @@ export function markRateLimited(id, hours = 24) {
     }
 }
 
-export function markRateLimitedByToken(tokenValue, hours = 24) {
+export function markRateLimitedByToken(tokenValue, hours = RATE_LIMIT_DEFAULT_HOURS) {
     if (typeof tokenValue !== 'string' || !tokenValue) return 0;
     const tokens = loadTokens();
     const resetAt = new Date(Date.now() + hours * 3600 * 1000).toISOString();
@@ -127,5 +171,5 @@ export function markValid(id, newToken) {
 }
 
 export function listTokens() {
-    return loadTokens();
+    return filterForInstance(loadTokens());
 }

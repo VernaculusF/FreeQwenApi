@@ -1,15 +1,17 @@
 import express from 'express';
 import bodyParser from 'body-parser';
 
-import { initBrowser, shutdownBrowser } from './src/browser/browser.js';
+import { initBrowser, shutdownBrowser, startBrowserWatchdog, stopBrowserWatchdog } from './src/browser/browser.js';
 import apiRoutes from './src/api/routes.js';
 import { getAvailableModelsFromFile, getApiKeys } from './src/api/chat.js';
-import { loadTokens } from './src/api/tokenManager.js';
+import { listTokens } from './src/api/tokenManager.js';
+import { startTokenHealthCheck, stopTokenHealthCheck } from './src/api/tokenHealthCheck.js';
+import { startCleanup, stopCleanup } from './src/api/cleanup.js';
 import { addAccountInteractive } from './src/utils/accountSetup.js';
 import { logHttpRequest, logInfo, logError, logWarn } from './src/logger/index.js';
 import { prompt } from './src/utils/prompt.js';
 import { FORGETMEAI_WATERMARK } from './src/utils/branding.js';
-import { PORT, HOST } from './src/config.js';
+import { PORT, HOST, REQUIRE_API_KEYS, ACCOUNT_SUBSET } from './src/config.js';
 import { isBrowserOriginAllowed, normalizeOrigin, parseAllowedOrigins } from './src/api/originPolicy.js';
 
 const app = express();
@@ -27,10 +29,16 @@ function toBoolean(value) {
     return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
 }
 
-const skipAccountMenu = toBoolean(process.env.SKIP_ACCOUNT_MENU) || toBoolean(process.env.NON_INTERACTIVE);
+// Воркер-режим (ACCOUNT_SUBSET задан лаунчером `npm run workers`): меню не
+// показываем, стартуем сразу со своей долей аккаунтов.
+const skipAccountMenu = toBoolean(process.env.SKIP_ACCOUNT_MENU) || toBoolean(process.env.NON_INTERACTIVE) || Boolean(ACCOUNT_SUBSET);
 
 function ensureNonInteractiveTokens() {
-    const tokens = loadTokens();
+    // listTokens() уже отфильтрован под ACCOUNT_SUBSET этого инстанса.
+    const tokens = listTokens();
+    if (ACCOUNT_SUBSET) {
+        logInfo(`Воркер-режим: подмножество "${ACCOUNT_SUBSET}" — назначено ${tokens.length} аккаунтов.`);
+    }
     if (!tokens.length) {
         logError('Не найдено ни одного аккаунта. Запустите скрипт авторизации перед запуском сервера.');
         process.exit(1);
@@ -90,13 +98,49 @@ app.use((err, req, res, next) => {
 process.on('SIGINT', handleShutdown);
 process.on('SIGTERM', handleShutdown);
 process.on('SIGHUP', handleShutdown);
-process.on('uncaughtException', async (error) => {
-    logError('Необработанное исключение', error);
-    await handleShutdown();
+// ─── Обработчики неожиданных ошибок ──────────────────────────────────────────
+// Одиночная ошибка не должна ронять процесс: логируем и продолжаем работать.
+// Если ошибки лавиной падают в течение окна — корректно завершаем работу,
+// чтобы менеджер процессов (systemd/docker/PM2) перезапустил сервис.
+let errorStormStart = 0;
+let errorStormCount = 0;
+const ERROR_STORM_WINDOW_MS = Number(process.env.ERROR_STORM_WINDOW_MS) || 60_000;
+const ERROR_STORM_THRESHOLD = Number(process.env.ERROR_STORM_THRESHOLD) || 50;
+
+function recordUnexpectedError() {
+    const now = Date.now();
+    if (now - errorStormStart > ERROR_STORM_WINDOW_MS) {
+        errorStormStart = now;
+        errorStormCount = 0;
+    }
+    errorStormCount += 1;
+    return errorStormCount >= ERROR_STORM_THRESHOLD;
+}
+
+function handleUnexpectedError(kind, error) {
+    if (kind === 'unhandledRejection') {
+        logError('Необработанное отклонение Promise (продолжаем работу)', error);
+    } else {
+        logError('Необработанное исключение (продолжаем работу)', error);
+    }
+    if (recordUnexpectedError()) {
+        logError(`Шторм ошибок (${ERROR_STORM_THRESHOLD}+ за ${Math.round(ERROR_STORM_WINDOW_MS / 1000)}с). Корректно завершаем работу для перезапуска менеджером процессов.`);
+        handleShutdown();
+    }
+}
+
+process.on('unhandledRejection', (reason) => {
+    handleUnexpectedError('unhandledRejection', reason);
+});
+process.on('uncaughtException', (error) => {
+    handleUnexpectedError('uncaughtException', error);
 });
 
 async function handleShutdown() {
     logInfo('\nПолучен сигнал завершения. Закрываем браузер...');
+    stopBrowserWatchdog();
+    stopTokenHealthCheck();
+    stopCleanup();
     await shutdownBrowser();
     logInfo('Завершение работы.');
     process.exit(0);
@@ -116,9 +160,19 @@ async function startServer() {
 
     logInfo('Запуск сервера...');
 
+    if (REQUIRE_API_KEYS) {
+        const keys = getApiKeys();
+        if (!keys.length) {
+            logError('REQUIRE_API_KEYS=1, но src/Authorization.txt пуст или отсутствует.');
+            logError('Добавьте API-ключи (по одному на строку) в src/Authorization.txt и перезапустите сервер.');
+            process.exit(1);
+        }
+        logInfo(`Авторизация по API-ключам включена: загружено ${keys.length} ключ(ей).`);
+    }
+
     if (!skipAccountMenu) {
         while (true) {
-            const tokens = loadTokens();
+            const tokens = listTokens();
             console.log('\nСписок аккаунтов:');
             if (!tokens.length) {
                 console.log('  (пусто)');
@@ -172,6 +226,9 @@ async function startServer() {
         logError('Не удалось инициализировать браузер. Завершение работы.');
         process.exit(1);
     }
+    startBrowserWatchdog();
+    startTokenHealthCheck();
+    startCleanup();
 
     try {
         app.listen(port, host, () => {

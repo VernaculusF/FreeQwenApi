@@ -15,7 +15,9 @@ ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm ci --omit=dev
+# npm ci работает, когда package-lock.json есть; если его нет (файл в .gitignore,
+# свежий clone) — fallback на npm install с теми же флагами.
+RUN npm ci --omit=dev || npm install --omit=dev
 
 COPY . .
 

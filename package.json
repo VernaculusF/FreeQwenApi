@@ -18,6 +18,7 @@
         "example:file-upload": "node examples/file-upload/upload-example.js",
         "example:streaming-test": "node examples/streaming-test.js",
         "auth": "node scripts/auth.js",
+        "workers": "node scripts/workers.js",
         "models:sync": "node scripts/sync_models.js",
         "smoke": "node scripts/smoke_test.js"
     },

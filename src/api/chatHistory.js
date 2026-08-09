@@ -9,10 +9,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const HISTORY_DIR = path.resolve(__dirname, '..', '..', SESSION_DIR, 'history');
 
-export function initHistoryDirectory() {
-    if (!fs.existsSync(HISTORY_DIR)) {
-        fs.mkdirSync(HISTORY_DIR, { recursive: true });
-        logInfo(`Создана директория для истории чатов: ${HISTORY_DIR}`);
+export function initHistoryDirectory(historyDir = HISTORY_DIR) {
+    if (!fs.existsSync(historyDir)) {
+        fs.mkdirSync(historyDir, { recursive: true });
+        logInfo(`Создана директория для истории чатов: ${historyDir}`);
     }
 }
 
@@ -79,9 +79,9 @@ export function saveHistory(chatId, data) {
     }
 }
 
-export function loadHistory(chatId) {
+export function loadHistory(chatId, historyDir = HISTORY_DIR) {
     try {
-        const historyFilePath = getHistoryFilePath(chatId);
+        const historyFilePath = resolveHistoryFilePath(historyDir, chatId);
         if (fs.existsSync(historyFilePath)) {
             const rawData = fs.readFileSync(historyFilePath, 'utf8');
             logDebug(`Данные чата ${chatId} успешно загружены`);
@@ -251,10 +251,10 @@ function addMessageToHistory(chatId, message) {
     }
 }
 
-export function getAllChats() {
+export function getAllChats(historyDir = HISTORY_DIR) {
     try {
-        initHistoryDirectory();
-        const files = fs.readdirSync(HISTORY_DIR);
+        initHistoryDirectory(historyDir);
+        const files = fs.readdirSync(historyDir);
         logDebug(`Получен список файлов чатов: ${files.length} файлов`);
 
         let convertedCount = 0;
@@ -262,7 +262,7 @@ export function getAllChats() {
             .filter(file => file.endsWith('.json'))
             .map(file => {
                 const chatId = file.replace('.json', '');
-                const chatData = loadHistory(chatId);
+                const chatData = loadHistory(chatId, historyDir);
 
                 if (chatData.wasConverted) {
                     convertedCount++;
@@ -290,9 +290,9 @@ export function getAllChats() {
     }
 }
 
-export function deleteChat(chatId) {
+export function deleteChat(chatId, historyDir = HISTORY_DIR) {
     try {
-        const historyFilePath = getHistoryFilePath(chatId);
+        const historyFilePath = resolveHistoryFilePath(historyDir, chatId);
         if (fs.existsSync(historyFilePath)) {
             fs.unlinkSync(historyFilePath);
             logInfo(`Чат ${chatId} успешно удален`);
@@ -306,12 +306,12 @@ export function deleteChat(chatId) {
     return false;
 }
 
-export function deleteChatsAutomatically(criteria = {}) {
+export function deleteChatsAutomatically(criteria = {}, historyDir = HISTORY_DIR) {
     try {
         const { olderThan, userMessageCountLessThan, messageCountLessThan, maxChats } = criteria;
         logInfo(`Автоудаление чатов с критериями: ${JSON.stringify(criteria)}`);
 
-        const chats = getAllChats();
+        const chats = getAllChats(historyDir);
         logInfo(`Найдено ${chats.length} чатов для проверки`);
 
         let chatsToDelete = [...chats];
@@ -357,7 +357,7 @@ export function deleteChatsAutomatically(criteria = {}) {
         logInfo(`Найдено ${chatsToDelete.length} чатов для удаления`);
 
         for (const chat of chatsToDelete) {
-            if (deleteChat(chat.id)) {
+            if (deleteChat(chat.id, historyDir)) {
                 deletedChats.push(chat.id);
             }
         }

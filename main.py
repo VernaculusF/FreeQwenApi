@@ -36,7 +36,7 @@ CHAT_API_URL = f"{QWEN_BASE_URL}/api/v2/chat/completions"
 CREATE_CHAT_URL = f"{QWEN_BASE_URL}/api/v2/chats/new"
 SESSION_DIR = "session"
 TOKENS_FILE = os.path.join(SESSION_DIR, "tokens.json")
-DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "qwen3.7-max")
+DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "qwen3.8-max")
 AVAILABLE_MODELS_FILE = os.path.join("src", "AvailableModels.txt")
 AUTH_KEYS_FILE = os.path.join("src", "Authorization.txt")
 

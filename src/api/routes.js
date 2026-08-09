@@ -1,6 +1,8 @@
 import express from 'express';
-import { sendMessage, getAllModels, getApiKeys, createChatV2, pollQwenTaskStatus, extractMediaUrl, pagePool, extractAuthToken, preflightFileRequest, testToken } from './chat.js';
+import { sendMessage, getAllModels, getApiKeys, createChatV2, pollQwenTaskStatus, extractMediaUrl, pagePool, extractAuthToken, getAuthToken, preflightFileRequest } from './chat.js';
+import { checkQwenAuthLive } from './authStatusCheck.js';
 import { sendApiResultError } from './apiErrors.js';
+import { resolveAuthDecision } from './authPolicy.js';
 import { getAuthenticationStatus, getBrowserContext } from '../browser/browser.js';
 import { checkAuthentication } from '../browser/auth.js';
 import { logInfo, logError, logDebug } from '../logger/index.js';
@@ -8,7 +10,7 @@ import { getMappedModel } from './modelMapping.js';
 import { getStsToken, uploadFileToQwen } from './fileUpload.js';
 import { loadHistory, saveHistory } from './chatHistory.js';
 import { generateImage, getAvailableImageModels, checkImageApiAvailability } from './imageGeneration.js';
-import { MAX_FILE_SIZE, UPLOADS_DIR, DEFAULT_MODEL, STREAMING_CHUNK_DELAY, ALLOW_UNSCOPED_SESSION_CHAT_RESTORE, HOST, PORT } from '../config.js';
+import { MAX_FILE_SIZE, UPLOADS_DIR, DEFAULT_MODEL, STREAMING_CHUNK_DELAY, ALLOW_UNSCOPED_SESSION_CHAT_RESTORE, HOST, PORT, REQUIRE_API_KEYS } from '../config.js';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
@@ -22,8 +24,6 @@ import {
     createConversationIdentityRegistry,
     createKeyedQueue,
     createScopedConversationAlias,
-    fingerprintClientCredential,
-    matchesClientCredential,
     scopeClientChatIdentity
 } from './keyedQueue.js';
 
@@ -337,6 +337,26 @@ setInterval(() => {
 const router = express.Router();
 const conversationQueue = createKeyedQueue();
 
+// Отменяет обработку запроса, если клиент оборвал соединение (SSE-disconnect).
+// sendMessage/поллинг получают signal и освобождают страницу из пула раньше,
+// чем истёк бы таймаут.
+function withClientAbortSignal(res) {
+    const controller = new AbortController();
+    const onClose = () => {
+        if (!res.writableEnded) controller.abort();
+    };
+    res.once('close', onClose);
+    return controller.signal;
+}
+
+// Безопасное завершение SSE-ответа: после обрыва клиента писать в сокет нельзя,
+// иначе — синхронный ERR_STREAM_DESTROYED и шум в логах.
+function safeEndSse(res) {
+    if (res.destroyed || res.writableEnded) return;
+    res.write('data: [DONE]\n\n');
+    res.end();
+}
+
 router.head('/', (req, res) => res.sendStatus(200));
 router.get('/', (req, res) => res.json({ ok: true, service: 'FreeQwenApi', baseUrl: '/api' }));
 
@@ -358,26 +378,20 @@ const upload = multer({ storage, limits: { fileSize: MAX_FILE_SIZE } });
 // ─── Auth middleware ─────────────────────────────────────────────────────────
 
 function authMiddleware(req, res, next) {
-    const apiKeys = getApiKeys();
-    if (apiKeys.length === 0) {
-        req.proxyClientKeyFingerprint = null;
-        return next();
-    }
+    // /health — публичный liveness-эндпоинт для healthcheck'ов (Docker/K8s):
+    // не содержит секретов и не требует авторизации.
+    if (req.path === '/health') return next();
 
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        logError('Отсутствует или некорректный заголовок авторизации');
-        return res.status(401).json({ error: 'Требуется авторизация' });
+    const decision = resolveAuthDecision({
+        apiKeys: getApiKeys(),
+        authHeader: req.headers.authorization,
+        requireApiKeys: REQUIRE_API_KEYS
+    });
+    if (!decision.ok) {
+        logError(decision.error);
+        return res.status(decision.status).json({ error: decision.error });
     }
-
-    const token = authHeader.substring(7).trim();
-    if (!matchesClientCredential(token, apiKeys)) {
-        logError('Предоставлен недействительный API ключ');
-        return res.status(401).json({ error: 'Недействительный токен' });
-    }
-    // Keep only a one-way fingerprint on the request; never persist or log the
-    // validated proxy bearer itself.
-    req.proxyClientKeyFingerprint = fingerprintClientCredential(token);
+    req.proxyClientKeyFingerprint = decision.fingerprint;
     next();
 }
 
@@ -965,8 +979,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, includeUsage = f
         choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }]
     }) + '\n\n');
     if (includeUsage) writeOpenAIUsageSse(res, base, result.usage);
-    res.write('data: [DONE]\n\n');
-    res.end();
+    safeEndSse(res);
 }
 
 // ─── Helpers: streaming ──────────────────────────────────────────────────────
@@ -976,7 +989,10 @@ async function handleStreamingResponse(res, mappedModel, messageContent, chatId,
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
-    const writeSse = (payload) => res.write('data: ' + JSON.stringify(payload) + '\n\n');
+    const writeSse = (payload) => {
+        if (res.destroyed || res.writableEnded) return;
+        res.write('data: ' + JSON.stringify(payload) + '\n\n');
+    };
 
     writeSse({
         id: 'chatcmpl-stream', object: 'chat.completion.chunk',
@@ -1012,8 +1028,7 @@ async function handleStreamingResponse(res, mappedModel, messageContent, chatId,
             created: Math.floor(Date.now() / 1000), model: mappedModel,
             choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
         });
-        res.write('data: [DONE]\n\n');
-        res.end();
+        safeEndSse(res);
     } catch (error) {
         logError('Ошибка при обработке потокового запроса', error);
         writeSse({
@@ -1021,8 +1036,7 @@ async function handleStreamingResponse(res, mappedModel, messageContent, chatId,
             created: Math.floor(Date.now() / 1000), model: mappedModel,
             choices: [{ index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }]
         });
-        res.write('data: [DONE]\n\n');
-        res.end();
+        safeEndSse(res);
     }
 }
 
@@ -1047,6 +1061,7 @@ function handleNonStreamingResponse(res, result, mappedModel) {
 
 router.post('/chat', async (req, res) => {
     try {
+        const signal = withClientAbortSignal(res);
         const { message, messages, model, chatId, parentId, stream, chatType, size, waitForCompletion } = req.body;
 
         // Поддержка как message, так и messages для совместимости
@@ -1106,6 +1121,7 @@ router.post('/chat', async (req, res) => {
             res.setHeader('X-Accel-Buffering', 'no');
 
             const writeSse = (payload) => {
+                if (res.destroyed || res.writableEnded) return;
                 res.write('data: ' + JSON.stringify(payload) + '\n\n');
             };
 
@@ -1144,7 +1160,8 @@ router.post('/chat', async (req, res) => {
                     0,
                     streamingCallback,
                     resetMessageContent,
-                    getSessionKey(req)
+                    getSessionKey(req),
+                    signal
                 );
 
                 if (!isMeta && result.chatId) {
@@ -1196,8 +1213,7 @@ router.post('/chat', async (req, res) => {
                         { index: 0, delta: {}, finish_reason: 'stop' }
                     ]
                 });
-                res.write('data: [DONE]\n\n');
-                res.end();
+                safeEndSse(res);
                 return;
             } catch (error) {
                 logError('Ошибка при обработке потокового запроса', error);
@@ -1210,8 +1226,7 @@ router.post('/chat', async (req, res) => {
                         { index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }
                     ]
                 });
-                res.write('data: [DONE]\n\n');
-                res.end();
+                safeEndSse(res);
                 return;
             }
         }
@@ -1232,7 +1247,8 @@ router.post('/chat', async (req, res) => {
             0,
             null,
             resetMessageContent,
-            getSessionKey(req)
+            getSessionKey(req),
+            signal
         );
 
         if (!isMeta && result.chatId) {
@@ -1324,21 +1340,24 @@ router.get('/status', async (req, res) => {
     try {
         logInfo('Запрос статуса авторизации');
         const tokens = listTokens();
-        const accounts = await Promise.all(tokens.map(async t => {
+        const now = Date.now();
+        const accounts = [];
+
+        for (const t of tokens) {
             const accInfo = { id: t.id, status: 'UNKNOWN', resetAt: t.resetAt || null };
 
-            if (t.resetAt) {
-                const resetTime = new Date(t.resetAt).getTime();
-                if (resetTime > Date.now()) { accInfo.status = 'WAIT'; return accInfo; }
-            }
+            if (t.resetAt && new Date(t.resetAt).getTime() > now) { accInfo.status = 'WAIT'; accounts.push(accInfo); continue; }
+            if (t.invalid) { accInfo.status = 'INVALID'; accounts.push(accInfo); continue; }
 
-            const testResult = await testToken(t.token);
-            if (testResult === 'OK') { accInfo.status = 'OK'; if (t.invalid || t.resetAt) markValid(t.id); }
-            else if (testResult === 'RATELIMIT') { accInfo.status = 'WAIT'; markRateLimited(t.id, 24); }
-            else if (testResult === 'UNAUTHORIZED') { accInfo.status = 'INVALID'; if (!t.invalid) markInvalid(t.id); }
+            // Живая проверка с кэшем: повторные запросы в пределах TTL не бьют в Qwen.
+            const live = await checkQwenAuthLive(t.token);
+            if (live.status === 'ok') { accInfo.status = 'OK'; if (t.invalid || t.resetAt) markValid(t.id); }
+            else if (live.status === 'ratelimit') { accInfo.status = 'WAIT'; markRateLimited(t.id); }
+            else if (live.status === 'unauthorized') { accInfo.status = 'INVALID'; if (!t.invalid) markInvalid(t.id); }
             else { accInfo.status = 'ERROR'; }
-            return accInfo;
-        }));
+            accInfo.live = live;
+            accounts.push(accInfo);
+        }
 
         const browserContext = getBrowserContext();
         if (!browserContext) {
@@ -1346,12 +1365,32 @@ router.get('/status', async (req, res) => {
             return res.json({ authenticated: false, message: 'Браузер не инициализирован', accounts });
         }
 
-        if (getAuthenticationStatus()) return res.json({ accounts });
+        const browserToken = getAuthToken();
+        let authenticated = getAuthenticationStatus();
+        let message = authenticated ? 'Авторизация активна' : 'Требуется авторизация';
+        let live = null;
 
-        await checkAuthentication(browserContext);
-        const isAuthenticated = getAuthenticationStatus();
-        logInfo(`Статус авторизации: ${isAuthenticated ? 'активна' : 'требуется авторизация'}`);
-        res.json({ authenticated: isAuthenticated, message: isAuthenticated ? 'Авторизация активна' : 'Требуется авторизация', accounts });
+        if (browserToken) {
+            // Реальная проверка текущей сессии Qwen (кэш + лёгкий retry).
+            live = await checkQwenAuthLive(browserToken);
+            if (live.status === 'ok' || live.status === 'ratelimit') {
+                authenticated = true;
+                message = 'Авторизация активна';
+            } else if (live.status === 'unauthorized') {
+                authenticated = false;
+                message = 'Сессия Qwen истекла (401): требуется повторная авторизация';
+            } else {
+                // Транзиентная ошибка проверки — показываем состояние флага браузера.
+                message = 'Не удалось проверить сессию (транзиентная ошибка)';
+            }
+        } else if (!authenticated) {
+            await checkAuthentication(browserContext);
+            authenticated = getAuthenticationStatus();
+            message = authenticated ? 'Авторизация активна' : 'Требуется авторизация';
+        }
+
+        logInfo(`Статус авторизации: ${authenticated ? 'активна' : 'требуется авторизация'}${live ? ` (live: ${live.status})` : ''}`);
+        res.json({ authenticated, message, accounts, live });
     } catch (error) {
         logError('Ошибка при проверке статуса авторизации', error);
         res.status(500).json({ error: 'Внутренняя ошибка сервера' });
@@ -1383,6 +1422,7 @@ router.get('/chat/completions', (req, res) => {
 
 router.post('/chat/completions', async (req, res) => {
     try {
+        const signal = withClientAbortSignal(res);
         const { messages, model, stream, tools, functions, tool_choice, chatId } = req.body;
         const snakeCaseChatId = normalizeIdValue(req.body?.chat_id);
         const explicitChatId = normalizeIdValue(chatId) || snakeCaseChatId;
@@ -1518,6 +1558,7 @@ router.post('/chat/completions', async (req, res) => {
             res.setHeader('Transfer-Encoding', 'chunked');
 
             const writeSse = (payload) => {
+                if (res.destroyed || res.writableEnded) return;
                 res.write('data: ' + JSON.stringify(payload) + '\n\n');
             };
 
@@ -1558,7 +1599,8 @@ router.post('/chat/completions', async (req, res) => {
                     0,
                     streamingCallback,
                     preparedInput.resetMessageContent,
-                    getSessionKey(req)
+                    getSessionKey(req),
+                    signal
                 );
 
                 // Persist ownership before any response path can return early
@@ -1626,8 +1668,7 @@ router.post('/chat/completions', async (req, res) => {
                     ]
                 });
                 if (wantsOpenAIStreamUsage(req.body)) writeOpenAIUsageSse(res, finalBase, result.usage);
-                res.write('data: [DONE]\n\n');
-                res.end();
+                safeEndSse(res);
 
             } catch (error) {
                 logError('Ошибка при обработке потокового запроса', error);
@@ -1640,8 +1681,7 @@ router.post('/chat/completions', async (req, res) => {
                         { index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }
                     ]
                 });
-                res.write('data: [DONE]\n\n');
-                res.end();
+                safeEndSse(res);
             }
         } else {
             const qwenChatId = await resolveQwenChatId(effectiveChatId);
@@ -1660,7 +1700,8 @@ router.post('/chat/completions', async (req, res) => {
                 0,
                 null,
                 preparedInput.resetMessageContent,
-                getSessionKey(req)
+                getSessionKey(req),
+                signal
             );
 
             // Сохраняем chatId в сессию для следующих запросов
@@ -1728,6 +1769,7 @@ router.post('/chat/completions', async (req, res) => {
 // OpenAI совместимый эндпоинт v1 (для Open WebUI и других клиентов)
 router.post('/v1/chat/completions', async (req, res) => {
     try {
+        const signal = withClientAbortSignal(res);
         const { messages, model, stream, tools, functions, tool_choice, chatId } = req.body;
         const snakeCaseChatId = normalizeIdValue(req.body?.chat_id);
         const explicitChatId = normalizeIdValue(chatId) || snakeCaseChatId;
@@ -1866,6 +1908,7 @@ router.post('/v1/chat/completions', async (req, res) => {
             res.setHeader('Transfer-Encoding', 'chunked');
 
             const writeSse = (payload) => {
+                if (res.destroyed || res.writableEnded) return;
                 res.write('data: ' + JSON.stringify(payload) + '\n\n');
             };
 
@@ -1907,7 +1950,8 @@ router.post('/v1/chat/completions', async (req, res) => {
                     0,
                     streamingCallback,
                     preparedInput.resetMessageContent,
-                    getSessionKey(req)
+                    getSessionKey(req),
+                    signal
                 );
 
                 // Persist ownership before any response path can return early
@@ -1975,8 +2019,7 @@ router.post('/v1/chat/completions', async (req, res) => {
                     ]
                 });
                 if (wantsOpenAIStreamUsage(req.body)) writeOpenAIUsageSse(res, finalBase, result.usage);
-                res.write('data: [DONE]\n\n');
-                res.end();
+                safeEndSse(res);
 
             } catch (error) {
                 logError('Ошибка при обработке потокового запроса', error);
@@ -1989,8 +2032,7 @@ router.post('/v1/chat/completions', async (req, res) => {
                         { index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }
                     ]
                 });
-                res.write('data: [DONE]\n\n');
-                res.end();
+                safeEndSse(res);
             }
         } else {
             const qwenChatId = await resolveQwenChatId(effectiveChatId);
@@ -2010,7 +2052,8 @@ router.post('/v1/chat/completions', async (req, res) => {
                 0,
                 null,
                 preparedInput.resetMessageContent,
-                getSessionKey(req)
+                getSessionKey(req),
+                signal
             );
 
             // Сохраняем chatId в сессии для следующих запросов
@@ -2263,6 +2306,7 @@ function buildVideoResponse({ result, prompt, model, waitForCompletion }) {
  */
 router.post('/images/generations', async (req, res) => {
     try {
+        const signal = withClientAbortSignal(res);
         const { prompt, model, n, size, response_format, provider } = req.body;
 
         logInfo('Получен запрос на генерацию изображения');
@@ -2321,7 +2365,8 @@ router.post('/images/generations', async (req, res) => {
             0,
             null,
             null,
-            getSessionKey(req)
+            getSessionKey(req),
+            signal
         );
 
         if (result.error) {
@@ -2350,6 +2395,7 @@ router.post('/images/generations', async (req, res) => {
  */
 router.post('/videos/generations', async (req, res) => {
     try {
+        const signal = withClientAbortSignal(res);
         const { prompt, model, size, wait, waitForCompletion } = req.body;
         const shouldWait = waitForCompletion ?? wait ?? true;
 
@@ -2377,7 +2423,8 @@ router.post('/videos/generations', async (req, res) => {
             0,
             null,
             null,
-            getSessionKey(req)
+            getSessionKey(req),
+            signal
         );
 
         if (result.error) {
@@ -2399,11 +2446,12 @@ router.post('/videos/generations', async (req, res) => {
  */
 router.get('/tasks/status/:taskId', async (req, res) => {
     try {
+        const signal = withClientAbortSignal(res);
         const { taskId } = req.params;
         const wait = ['1', 'true', 'yes'].includes(String(req.query.wait || '').toLowerCase());
         if (!taskId) return res.status(400).json({ error: 'taskId обязателен' });
 
-        const result = await pollQwenTaskStatus(taskId, wait, getSessionKey(req));
+        const result = await pollQwenTaskStatus(taskId, wait, getSessionKey(req), signal);
         if (result.error && !result.data) {
             return sendApiResultError(res, result);
         }

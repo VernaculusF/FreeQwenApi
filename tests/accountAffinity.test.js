@@ -7,12 +7,12 @@ import {
 } from '../src/api/accountAffinity.js';
 import {
   bindResourceToAccount,
-  buildQwenRequestHeaders,
   getResourceAccountId,
   preflightFileRequest,
   resolveFileAccountId,
   sendMessage
 } from '../src/api/chat.js';
+import { buildQwenRequestHeaders } from '../src/api/qwenPing.js';
 
 function deferred() {
   let resolve;

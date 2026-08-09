@@ -1,6 +1,9 @@
-import { getBrowserContext, getAuthenticationStatus, setAuthenticationStatus } from '../browser/browser.js';
+import { getBrowserContext, getPageFromContext, getAuthenticationStatus, setAuthenticationStatus, isBrowserVisibleMode } from '../browser/browser.js';
 import { checkAuthentication, checkVerification } from '../browser/auth.js';
 import { shutdownBrowser, initBrowser } from '../browser/browser.js';
+import { withOperationGuard } from '../utils/operationGuard.js';
+import { buildQwenRequestHeaders, classifyQwenError } from './qwenPing.js';
+import { isAntiBotBody } from '../utils/verificationMarkers.js';
 import { saveAuthToken } from '../browser/session.js';
 import {
     getAvailableToken,
@@ -22,8 +25,9 @@ import crypto from 'crypto';
 import {
     CHAT_API_URL, CREATE_CHAT_URL, CHAT_PAGE_URL, TASK_STATUS_URL,
     PAGE_TIMEOUT, RETRY_DELAY, PAGE_POOL_SIZE,
-    DEFAULT_MODEL, MAX_RETRY_COUNT,
-    TASK_POLL_MAX_ATTEMPTS, TASK_POLL_INTERVAL
+    DEFAULT_MODEL, MAX_RETRY_COUNT, RATE_LIMIT_DEFAULT_HOURS,
+    TASK_POLL_MAX_ATTEMPTS, TASK_POLL_INTERVAL,
+    NON_INTERACTIVE, PAGE_EVALUATE_TIMEOUT, POOL_PROBE_TIMEOUT
 } from '../config.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -68,8 +72,12 @@ function snapshotManagedToken(tokenObj) {
     return snapshotAccountToken({ id: managedId, token: tokenObj?.token });
 }
 
-export function getBrowserFetchCredentials(accountId) {
-    return isBrowserAccountId(accountId) ? 'same-origin' : 'omit';
+export function getBrowserFetchCredentials() {
+    // Все запросы выполняются из страниц chat.qwen.ai: 'same-origin' отправляет
+    // cookies сессии, без которых WAF Qwen блокирует API-запросы
+    // (FAIL_SYS_USER_VALIDATE / _____tmd_____/punish). Cookies в headless-браузер
+    // подгружаются из session/accounts/*/cookies.json при инициализации.
+    return 'same-origin';
 }
 
 function snapshotBrowserToken(token) {
@@ -131,10 +139,6 @@ async function canRetryWithAnotherAccount(currentTokenObj, browserContext) {
     });
 }
 
-function asciiTimezone(date = new Date()) {
-    return date.toString().replace(/[\u0080-\uFFFF]/g, '');
-}
-
 export function buildQwenCompletionUrl(apiUrl, chatId) {
     if (!chatId) return apiUrl;
     const url = new URL(apiUrl, CHAT_PAGE_URL);
@@ -144,56 +148,9 @@ export function buildQwenCompletionUrl(apiUrl, chatId) {
     return url.toString();
 }
 
-export function buildQwenRequestHeaders(token, requestIdFactory = crypto.randomUUID) {
-    const headers = {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.8',
-        'Timezone': asciiTimezone(),
-        'Version': process.env.QWEN_WEB_VERSION || '0.2.63',
-        'X-Accel-Buffering': 'no',
-        'X-Request-Id': requestIdFactory(),
-        'source': 'web'
-    };
-
-    if (token) {
-        headers.Authorization = `Bearer ${token}`;
-    }
-
-    return headers;
-}
-
-// ─── Page helpers ────────────────────────────────────────────────────────────
-
-async function getPage(context) {
-    if (context && typeof context.newPage === 'function') {
-        return await context.newPage();
-    }
-
-    if (context && typeof context.goto === 'function') {
-        // Если передана Puppeteer Page, не переиспользуем её как рабочую:
-        // создаём отдельную вкладку из того же браузера, чтобы избежать гонок
-        // и случайного закрытия базовой страницы.
-        if (typeof context.browser === 'function') {
-            try {
-                const browser = context.browser();
-                if (browser && typeof browser.newPage === 'function') {
-                    return await browser.newPage();
-                }
-            } catch (error) {
-                logWarn(`Не удалось создать новую страницу из текущего контекста: ${error.message}`);
-            }
-        }
-
-        if (typeof context.isClosed === 'function' && context.isClosed()) {
-            throw new Error('Базовая страница браузера закрыта');
-        }
-
-        return context;
-    }
-
-    throw new Error('Неверный контекст: не страница Puppeteer, не контекст Playwright');
-}
+// Страницы, уничтоженные после таймаута/отмены. releasePage не должен
+// возвращать их в пул, даже если page.close() ещё выполняется.
+const disposedPages = new WeakSet();
 
 export const pagePool = {
     pages: [],
@@ -208,11 +165,18 @@ export const pagePool = {
                     logWarn('Базовая страница не должна быть в пуле, пропускаем');
                     continue;
                 }
+                if (disposedPages.has(page)) {
+                    logWarn('Страница из пула уничтожена, пропускаем');
+                    continue;
+                }
                 if (page.isClosed()) {
                     logWarn('Страница из пула закрыта, пропускаем');
                     continue;
                 }
-                await page.evaluate(() => document.readyState);
+                await withOperationGuard(
+                    page.evaluate(() => document.readyState),
+                    { timeoutMs: POOL_PROBE_TIMEOUT, label: 'Проверка страницы из пула' }
+                );
                 return page;
             } catch (e) {
                 logWarn(`Страница из пула протухла (${e.message?.substring(0, 60)}), создаём новую`);
@@ -222,7 +186,7 @@ export const pagePool = {
             }
         }
 
-        const newPage = await getPage(context);
+        const newPage = await getPageFromContext(context);
         await newPage.goto(CHAT_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT });
 
         if (!browserAuthToken) {
@@ -244,6 +208,7 @@ export const pagePool = {
         try {
             if (page.isClosed()) return;
         } catch { return; }
+        if (disposedPages.has(page)) return;
 
         const baseContext = getBrowserContext();
         if (page === baseContext) {
@@ -256,6 +221,20 @@ export const pagePool = {
         } else {
             page.close().catch(e => logError('Ошибка при закрытии страницы', e));
         }
+    },
+
+    // Закрывает страницу насовсем (не возвращает в пул). Используется, когда
+    // на странице мог остаться незавершённый fetch после таймаута/отмены —
+    // переиспользование такой страницы рискованно.
+    disposePage(page) {
+        const baseContext = getBrowserContext();
+        if (page === baseContext) return;
+        disposedPages.add(page);
+        try {
+            if (!page.isClosed()) {
+                page.close().catch(e => logError('Ошибка при закрытии страницы после таймаута', e));
+            }
+        } catch { /* already dead */ }
     },
 
     async clear() {
@@ -272,14 +251,19 @@ export const pagePool = {
 
 // ─── Task polling ────────────────────────────────────────────────────────────
 
-export async function pollTaskStatus(taskId, page, token, maxAttempts = TASK_POLL_MAX_ATTEMPTS, interval = TASK_POLL_INTERVAL, credentials = 'omit') {
+export async function pollTaskStatus(taskId, page, token, maxAttempts = TASK_POLL_MAX_ATTEMPTS, interval = TASK_POLL_INTERVAL, credentials = 'omit', signal = null) {
     logInfo(`Начинаем опрос статуса задачи: ${taskId}`);
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        if (signal?.aborted) {
+            logWarn(`Опрос задачи ${taskId} отменён клиентом`);
+            return { success: false, status: 'aborted', error: 'Запрос отменён клиентом' };
+        }
         try {
             const statusUrl = `${TASK_STATUS_URL}/${taskId}`;
 
-            const result = await page.evaluate(async (data) => {
+            const result = await withOperationGuard(
+                page.evaluate(async (data) => {
                 try {
                     const response = await fetch(data.url, {
                         method: 'GET',
@@ -296,7 +280,14 @@ export async function pollTaskStatus(taskId, page, token, maxAttempts = TASK_POL
                 } catch (e) {
                     return { success: false, error: e.toString() };
                 }
-            }, { url: statusUrl, token, credentials });
+                }, { url: statusUrl, token, credentials }),
+                {
+                    timeoutMs: PAGE_EVALUATE_TIMEOUT,
+                    signal,
+                    label: `Опрос задачи ${taskId}`,
+                    onAbort: () => pagePool.disposePage(page)
+                }
+            );
 
             if (!result.success) {
                 logWarn(`Ошибка при проверке статуса (попытка ${attempt}/${maxAttempts}): ${result.error}`);
@@ -321,6 +312,10 @@ export async function pollTaskStatus(taskId, page, token, maxAttempts = TASK_POL
             if (attempt < maxAttempts) await delay(interval);
         } catch (error) {
             logError(`Ошибка при опросе задачи (попытка ${attempt}/${maxAttempts})`, error);
+            if (error?.code === 'ETIMEDOUT' || error?.code === 'ABORTED') {
+                logWarn(`Опрос задачи ${taskId} остановлен (${error.code})`);
+                return { success: false, status: 'timeout', error: error.message || 'Опрос задачи остановлен' };
+            }
             if (attempt < maxAttempts) await delay(interval);
         }
     }
@@ -335,30 +330,40 @@ export async function extractAuthToken(context, forceRefresh = false) {
     if (browserAuthToken && !forceRefresh) return browserAuthToken;
 
     try {
-        const page = await getPage(context);
-        const shouldClosePage = page !== context;
+        // В видимом режиме (ручная авторизация) НЕ создаём новую вкладку: базовый
+        // контекст уже находится на chat.qwen.ai с токеном в storage — читаем его
+        // напрямую без навигации. Так окно не дёргается открытием/закрытием
+        // вкладки после завершения авторизации.
+        const reuseBase = isBrowserVisibleMode() && context && typeof context.evaluate === 'function';
+        const page = reuseBase ? context : await getPageFromContext(context);
+        const shouldClosePage = !reuseBase && page !== context;
         try {
-            await page.goto(CHAT_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT });
-            await delay(RETRY_DELAY);
+            if (!reuseBase) {
+                await page.goto(CHAT_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT });
+                await delay(RETRY_DELAY);
+            }
 
-            const newToken = await page.evaluate(async () => {
-                function findTokenInStorage(storage) {
-                    const directKeys = ['token', 'auth_token', 'access_token', 'id_token', 'qwen_token'];
-                    for (const key of directKeys) {
-                        const value = storage.getItem(key);
-                        if (value) return value;
+            const newToken = await withOperationGuard(
+                page.evaluate(async () => {
+                    function findTokenInStorage(storage) {
+                        const directKeys = ['token', 'auth_token', 'access_token', 'id_token', 'qwen_token'];
+                        for (const key of directKeys) {
+                            const value = storage.getItem(key);
+                            if (value) return value;
+                        }
+                        const jwtLike = /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/;
+                        for (let i = 0; i < storage.length; i += 1) {
+                            const value = storage.getItem(storage.key(i)) || '';
+                            const match = value.match(jwtLike);
+                            if (match) return match[0];
+                        }
+                        return null;
                     }
-                    const jwtLike = /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/;
-                    for (let i = 0; i < storage.length; i += 1) {
-                        const value = storage.getItem(storage.key(i)) || '';
-                        const match = value.match(jwtLike);
-                        if (match) return match[0];
-                    }
-                    return null;
-                }
 
-                return findTokenInStorage(localStorage) || findTokenInStorage(sessionStorage);
-            });
+                    return findTokenInStorage(localStorage) || findTokenInStorage(sessionStorage);
+                }),
+                { timeoutMs: PAGE_EVALUATE_TIMEOUT, label: 'Извлечение токена авторизации' }
+            );
             if (shouldClosePage) await page.close();
 
             if (newToken) {
@@ -704,12 +709,7 @@ function buildPayloadV2(messageContent, model, chatId, parentId, files, systemMe
 
 export function isQwenAntiBotBody(body) {
     if (typeof body !== 'string') return false;
-    const lower = body.toLowerCase();
-    return lower.includes('/_____tmd_____/punish') ||
-        (lower.includes('window._config_') && lower.includes('captcha')) ||
-        lower.includes('rgv587') ||
-        lower.includes('fail_sys_user_validate') ||
-        lower.includes('purecaptcha');
+    return isAntiBotBody(body);
 }
 
 function parseNonSseCompletionBody(body) {
@@ -729,10 +729,10 @@ function parseNonSseCompletionBody(body) {
             Boolean(nestedCode);
 
         if (hasStructuredError) {
-            const isRateLimited = topLevelCode === 'RateLimited' || nestedCode === 'RateLimited';
+            const { kind } = classifyQwenError({ status: 0, errorBody: body, code: [topLevelCode, nestedCode] });
             return {
                 success: false,
-                status: isRateLimited ? 429 : 500,
+                status: kind === 'ratelimit' ? 429 : 500,
                 errorBody: body
             };
         }
@@ -747,7 +747,7 @@ function parseNonSseCompletionBody(body) {
     return { success: false, error: 'Unexpected non-SSE 200 response', errorBody: body };
 }
 
-async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChunk) {
+async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChunk, signal = null) {
     try {
         if (!token) return { success: false, error: 'Токен авторизации не найден' };
         if (typeof fetch !== 'function') return { success: false, error: 'Fetch API is unavailable' };
@@ -757,7 +757,8 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
         const response = await fetch(requestUrl, {
             method: 'POST',
             headers: buildQwenRequestHeaders(token),
-            body: JSON.stringify(payload)
+            body: JSON.stringify(payload),
+            signal: signal || undefined
         });
 
         if (!response.ok) {
@@ -801,6 +802,7 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
         let hasStreamedChunks = false;
 
         while (!finished) {
+            if (signal?.aborted) break;
             const { done, value } = await reader.read();
             if (done) break;
 
@@ -856,6 +858,10 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
             }
         }
 
+        if (signal?.aborted) {
+            return { success: false, error: 'Запрос отменён клиентом', aborted: true, hasStreamedChunks };
+        }
+
         if (streamError) {
             return { success: false, ...streamError, hasStreamedChunks };
         }
@@ -889,10 +895,17 @@ export function shouldReturnNodeStreamingResponse(streamedResponse, preferNodeFe
     );
 }
 
-async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, credentials = 'omit') {
+async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, credentials = 'omit', signal = null) {
+    if (signal?.aborted) {
+        return { success: false, error: 'Запрос отменён клиентом', aborted: true };
+    }
     const preferNodeFetch = String(process.env.QWEN_USE_NODE_FETCH || '').toLowerCase() === '1' || String(process.env.QWEN_USE_NODE_FETCH || '').toLowerCase() === 'true';
     if (payload?.stream !== false && (typeof onChunk === 'function' || preferNodeFetch)) {
-        const streamedResponse = await executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChunk);
+        const streamedResponse = await executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChunk, signal);
+
+        if (signal?.aborted) {
+            return { success: false, error: 'Запрос отменён клиентом', aborted: true };
+        }
 
         if (shouldReturnNodeStreamingResponse(streamedResponse, preferNodeFetch)) {
             return streamedResponse;
@@ -911,7 +924,8 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, c
     logDebug(`Используем токен: ${token ? 'Токен существует' : 'Токен отсутствует'}`);
     logDebug(`API URL: ${apiUrl}`);
 
-    return page.evaluate(async (data) => {
+    return withOperationGuard(
+        page.evaluate(async (data) => {
         try {
             const response = await fetch(data.apiUrl, {
                 method: 'POST',
@@ -947,11 +961,11 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, c
 
                         // API иногда возвращает JSON с success=false и code при HTTP 200.
                         if (hasStructuredError) {
-                            const isRateLimited = topLevelCode === 'RateLimited' || nestedCode === 'RateLimited';
-                            const antiBot = /rgv587|fail_sys_user_validate|_____tmd_____|purecaptcha/i.test(body);
+                            const { kind } = classifyQwenError({ status: 0, errorBody: body, code: [topLevelCode, nestedCode] });
+                            const antiBot = isAntiBotBody(body);
                             return {
                                 success: false,
-                                status: isRateLimited ? 429 : antiBot ? 403 : 500,
+                                status: kind === 'ratelimit' ? 429 : antiBot ? 403 : 500,
                                 antiBot,
                                 error: antiBot ? 'Qwen anti-bot challenge returned for browser fetch' : undefined,
                                 errorBody: body
@@ -1034,7 +1048,14 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, c
         } catch (error) {
             return { success: false, error: error.toString() };
         }
-    }, requestBody);
+        }, requestBody),
+        {
+            timeoutMs: PAGE_EVALUATE_TIMEOUT,
+            signal,
+            label: 'Запрос к Qwen API',
+            onAbort: () => pagePool.disposePage(page)
+        }
+    );
 }
 
 export function buildAccountSwitchRetryArgs(requestContext = {}) {
@@ -1051,7 +1072,8 @@ export function buildAccountSwitchRetryArgs(requestContext = {}) {
         retryCount = 0,
         onChunk = null,
         resetMessage = null,
-        clientScope = null
+        clientScope = null,
+        signal = null
     } = requestContext;
 
     return [
@@ -1069,7 +1091,8 @@ export function buildAccountSwitchRetryArgs(requestContext = {}) {
         retryCount + 1,
         onChunk,
         resetMessage,
-        clientScope
+        clientScope,
+        signal
     ];
 }
 
@@ -1086,8 +1109,17 @@ async function handleApiError(response, tokenObj, requestContext) {
     logError(`Ошибка при получении ответа: ${response.error || response.statusText || `HTTP ${response.status || 'unknown'}`}`);
     if (response.errorBody) logDebug(`Тело ответа с ошибкой: ${response.errorBody}`);
 
+    if (response.aborted) {
+        logWarn(`Запрос ${chatId} отменён клиентом, не ретраим`);
+        return { error: response.error || 'Запрос отменён клиентом', aborted: true, chatId };
+    }
+
     if (response.html && response.html.includes('Verification')) {
         setAuthenticationStatus(false);
+        if (NON_INTERACTIVE) {
+            logWarn('Требуется верификация Qwen (anti-bot), но сервер в NON_INTERACTIVE режиме: возвращаем 503 без перезапуска браузера.');
+            return { error: 'Требуется верификация (anti-bot). Сервер в NON_INTERACTIVE режиме; пройдите верификацию при интерактивном запуске.', verification: true, status: 503, chatId };
+        }
         logInfo('Обнаружена необходимость верификации, перезапуск браузера в видимом режиме...');
         await pagePool.clear();
         browserAuthToken = null;
@@ -1096,7 +1128,7 @@ async function handleApiError(response, tokenObj, requestContext) {
         return { error: 'Требуется верификация. Браузер запущен в видимом режиме.', verification: true, chatId };
     }
 
-    if (response.status === 401 || (response.errorBody && (response.errorBody.includes('Unauthorized') || response.errorBody.includes('Token has expired')))) {
+    if (classifyQwenError(response).kind === 'unauthorized') {
         logWarn(`Токен ${tokenObj?.id} недействителен (401). Удаляем и пробуем другой.`);
         chatAccountAffinity.forget(chatId);
         markInvalidByToken(tokenObj?.token);
@@ -1127,12 +1159,12 @@ async function handleApiError(response, tokenObj, requestContext) {
         return { error: 'Все токены недействительны (401). Требуется повторная авторизация.', chatId };
     }
 
-    if (response.status === 429 || (response.errorBody && response.errorBody.includes('RateLimited'))) {
-        let hours = 24;
+    if (classifyQwenError(response).kind === 'ratelimit') {
+        let hours = RATE_LIMIT_DEFAULT_HOURS;
         try {
             const rateInfo = JSON.parse(response.errorBody);
             const parsedHours = Number(rateInfo.num);
-            hours = Number.isFinite(parsedHours) && parsedHours > 0 ? parsedHours : 24;
+            hours = Number.isFinite(parsedHours) && parsedHours > 0 ? parsedHours : RATE_LIMIT_DEFAULT_HOURS;
         } catch { /* errorBody might not be valid JSON */ }
 
         markRateLimitedByToken(tokenObj?.token, hours);
@@ -1171,7 +1203,7 @@ async function handleApiError(response, tokenObj, requestContext) {
 
 // ─── Main public API ─────────────────────────────────────────────────────────
 
-export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null, parentId = null, files = null, tools = null, toolChoice = null, systemMessage = null, chatType = 't2t', size = null, waitForCompletion = true, retryCount = 0, onChunk = null, resetMessage = null, clientScope = null) {
+export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null, parentId = null, files = null, tools = null, toolChoice = null, systemMessage = null, chatType = 't2t', size = null, waitForCompletion = true, retryCount = 0, onChunk = null, resetMessage = null, clientScope = null, signal = null) {
     if (!availableModels) availableModels = getAvailableModelsFromFile();
 
     const validated = validateAndPrepareMessage(message);
@@ -1270,7 +1302,8 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
         resetMessage,
         fileAccountId: fileAffinity.accountId,
         browserContext,
-        clientScope
+        clientScope,
+        signal
     };
 
     if (!chatId) {
@@ -1292,7 +1325,15 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
 
         const verificationNeeded = await checkVerification(page);
         if (verificationNeeded) {
-            await page.reload({ waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT });
+            await withOperationGuard(
+                page.reload({ waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT }),
+                {
+                    timeoutMs: PAGE_TIMEOUT,
+                    signal,
+                    label: 'Перезагрузка страницы верификации',
+                    onAbort: () => pagePool.disposePage(page)
+                }
+            );
         }
 
         logInfo('Отправка запроса к API v2...');
@@ -1308,7 +1349,8 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
             payload,
             tokenObj.token,
             onChunk,
-            getBrowserFetchCredentials(tokenObj.id)
+            getBrowserFetchCredentials(tokenObj.id),
+            signal
         );
 
         if (response.success && response.isTask) {
@@ -1350,7 +1392,8 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
                 tokenObj.token,
                 TASK_POLL_MAX_ATTEMPTS,
                 TASK_POLL_INTERVAL,
-                getBrowserFetchCredentials(tokenObj.id)
+                getBrowserFetchCredentials(tokenObj.id),
+                signal
             );
 
             pagePool.releasePage(page);
@@ -1462,7 +1505,7 @@ function extractVideoUrl(taskData) {
     return extractMediaUrl(taskData, 'video');
 }
 
-export async function pollQwenTaskStatus(taskId, waitForCompletion = false, clientScope = null) {
+export async function pollQwenTaskStatus(taskId, waitForCompletion = false, clientScope = null, signal = null) {
     const boundAccountId = getResourceAccountId('task', taskId, clientScope);
     if (!boundAccountId) {
         return {
@@ -1488,9 +1531,10 @@ export async function pollQwenTaskStatus(taskId, waitForCompletion = false, clie
                 tokenObj.token,
                 TASK_POLL_MAX_ATTEMPTS,
                 TASK_POLL_INTERVAL,
-                getBrowserFetchCredentials(tokenObj.id)
+                getBrowserFetchCredentials(tokenObj.id),
+                signal
             )
-            : await pollTaskStatus(taskId, page, tokenObj.token, 1, 0, getBrowserFetchCredentials(tokenObj.id));
+            : await pollTaskStatus(taskId, page, tokenObj.token, 1, 0, getBrowserFetchCredentials(tokenObj.id), signal);
 
         const mediaUrl = extractMediaUrl(result.data || result, 'video') || extractMediaUrl(result.data || result, 'image');
         return {
@@ -1539,20 +1583,27 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый ч
             credentials: getBrowserFetchCredentials(tokenObj.id)
         };
 
-        const result = await page.evaluate(async (data) => {
-            try {
-                const response = await fetch(data.apiUrl, {
-                    method: 'POST',
-                    credentials: data.credentials,
-                    headers: data.headers,
-                    body: JSON.stringify(data.payload)
-                });
-                if (response.ok) return { success: true, data: await response.json() };
-                return { success: false, status: response.status, errorBody: await response.text() };
-            } catch (error) {
-                return { success: false, error: error.toString() };
+        const result = await withOperationGuard(
+            page.evaluate(async (data) => {
+                try {
+                    const response = await fetch(data.apiUrl, {
+                        method: 'POST',
+                        credentials: data.credentials,
+                        headers: data.headers,
+                        body: JSON.stringify(data.payload)
+                    });
+                    if (response.ok) return { success: true, data: await response.json() };
+                    return { success: false, status: response.status, errorBody: await response.text() };
+                } catch (error) {
+                    return { success: false, error: error.toString() };
+                }
+            }, requestBody),
+            {
+                timeoutMs: PAGE_EVALUATE_TIMEOUT,
+                label: 'Создание чата',
+                onAbort: () => pagePool.disposePage(page)
             }
-        }, requestBody);
+        );
 
         pagePool.releasePage(page);
         page = null;
@@ -1571,20 +1622,19 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый ч
 
         const structuredErrorBody = result.errorBody || (result.data ? JSON.stringify(result.data) : null);
         const resultCode = result.data?.code || result.data?.data?.code;
-        const isUnauthorized = result.status === 401
-            || /Unauthorized|Token has expired/i.test(structuredErrorBody || '');
-        const isRateLimited = result.status === 429 || resultCode === 'RateLimited';
-        const effectiveStatus = isUnauthorized ? 401 : isRateLimited ? 429 : result.status;
+        const { kind, effectiveStatus } = classifyQwenError({ status: result.status, errorBody: structuredErrorBody, code: resultCode });
+        const isUnauthorized = kind === 'unauthorized';
+        const isRateLimited = kind === 'ratelimit';
         if (isUnauthorized) markInvalidByToken(tokenObj.token);
         if (isUnauthorized && (isBrowserAccountId(tokenObj.id) || browserAuthToken === tokenObj.token)) {
             browserAuthToken = null;
             setAuthenticationStatus(false);
         }
         if (isRateLimited) {
-            let hours = 24;
+            let hours = RATE_LIMIT_DEFAULT_HOURS;
             try {
                 const parsedHours = Number(JSON.parse(structuredErrorBody).num);
-                hours = Number.isFinite(parsedHours) && parsedHours > 0 ? parsedHours : 24;
+                hours = Number.isFinite(parsedHours) && parsedHours > 0 ? parsedHours : RATE_LIMIT_DEFAULT_HOURS;
             } catch { /* non-JSON body */ }
             markRateLimitedByToken(tokenObj.token, hours);
             if (isBrowserAccountId(tokenObj.id) || browserAuthToken === tokenObj.token) {
@@ -1625,50 +1675,3 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый ч
     }
 }
 
-// ─── testToken ───────────────────────────────────────────────────────────────
-
-export async function testToken(token) {
-    const browserContext = getBrowserContext();
-    if (!browserContext) return 'ERROR';
-
-    let page;
-    let shouldClosePage = false;
-    try {
-        page = await getPage(browserContext);
-        shouldClosePage = page !== browserContext;
-        await page.goto(CHAT_PAGE_URL, { waitUntil: 'domcontentloaded' });
-
-        const requestBody = {
-            apiUrl: CHAT_API_URL,
-            headers: buildQwenRequestHeaders(token),
-            credentials: 'omit',
-            payload: { chat_type: 't2t', messages: [{ role: 'user', content: 'ping', chat_type: 't2t' }], model: DEFAULT_MODEL, stream: false }
-        };
-
-        const result = await page.evaluate(async (data) => {
-            try {
-                const res = await fetch(data.apiUrl, {
-                    method: 'POST',
-                    credentials: data.credentials,
-                    headers: data.headers,
-                    body: JSON.stringify(data.payload)
-                });
-                return { ok: res.ok, status: res.status };
-            } catch (e) {
-                return { ok: false, status: 0, error: e.toString() };
-            }
-        }, requestBody);
-
-        if (result.ok || result.status === 400) return 'OK';
-        if (result.status === 401 || result.status === 403) return 'UNAUTHORIZED';
-        if (result.status === 429) return 'RATELIMIT';
-        return 'ERROR';
-    } catch (e) {
-        logError('testToken error', e);
-        return 'ERROR';
-    } finally {
-        if (page) {
-            try { if (shouldClosePage) await page.close(); } catch { }
-        }
-    }
-}

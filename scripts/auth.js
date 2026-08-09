@@ -4,6 +4,7 @@ import { loadTokens } from '../src/api/tokenManager.js';
 import { addAccountInteractive, reloginAccountInteractive, removeAccountInteractive } from '../src/utils/accountSetup.js';
 import { formatForgetMeAiWatermark } from '../src/utils/branding.js';
 import { prompt } from '../src/utils/prompt.js';
+import { importTokensFromFile } from './importTokens.js';
 
 function printDivider() {
     console.log('======================================================');
@@ -47,7 +48,14 @@ function handleList(tokens) {
 }
 
 function parseArgs(argv) {
-    const args = new Set(argv.slice(2));
+    const raw = argv.slice(2);
+    const importIndex = raw.indexOf('--import');
+    if (importIndex !== -1) {
+        const file = raw[importIndex + 1];
+        if (!file || file.startsWith('--')) return 'help';
+        return { action: 'import', file };
+    }
+    const args = new Set(raw);
     if (args.has('--help') || args.has('-h')) return 'help';
     if (args.has('--list')) return 'list';
     if (args.has('--add')) return 'add';
@@ -62,10 +70,11 @@ function printHelp() {
     console.log(formatForgetMeAiWatermark());
     printDivider();
     console.log('Опции:');
-    console.log('  --list      Показать список аккаунтов и статусы');
-    console.log('  --add       Добавить новый аккаунт');
-    console.log('  --relogin   Перелогинить аккаунт с истекшим токеном');
-    console.log('  --remove    Удалить аккаунт');
+    console.log('  --list                Показать список аккаунтов и статусы');
+    console.log('  --add                 Добавить новый аккаунт (интерактивно)');
+    console.log('  --import <файл>       Массовый импорт токенов (без браузера); --check для проверки');
+    console.log('  --relogin             Перелогинить аккаунт с истекшим токеном');
+    console.log('  --remove              Удалить аккаунт');
     console.log('Без опций запускается интерактивное меню.');
     printDivider();
 }
@@ -73,6 +82,11 @@ function printHelp() {
 async function runCliAction(action) {
     if (action === 'help') {
         printHelp();
+        return;
+    }
+
+    if (action && action.action === 'import') {
+        await importTokensFromFile(action.file, process.argv.slice(3));
         return;
     }
 

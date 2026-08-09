@@ -1,7 +1,7 @@
 # FreeQwenApi — ForgetMeAI fork
 
 > **Локальный OpenAI-compatible прокси к Qwen Chat** от [t.me/forgetmeai](https://t.me/forgetmeai).  
-> Текст, модели Qwen 3.7, файлы, Open WebUI, Hermes/LiteLLM, а теперь ещё генерация изображений и видео через Qwen Chat.
+> Текст, модели Qwen 3.8, файлы, Open WebUI, Hermes/LiteLLM, а теперь ещё генерация изображений и видео через Qwen Chat.
 
 ![ForgetMeAI](https://img.shields.io/badge/ForgetMeAI-t.me%2Fforgetmeai-blue)
 ![API](https://img.shields.io/badge/API-OpenAI--compatible-green)
@@ -20,7 +20,7 @@ http://localhost:3264/api
 ## Возможности fork
 
 - **Chat Completions API**: `POST /api/chat/completions`, совместимый с OpenAI SDK, Open WebUI, LiteLLM и агентами.
-- **Актуальные модели Qwen Chat**: `qwen3.7-max`, `qwen3.7-plus`, `qwen3.6-plus` и другие модели из `src/AvailableModels.txt`.
+- **Актуальные модели Qwen Chat**: `qwen3.8-max`, `qwen3.7-plus`, `qwen3.7-max` и другие модели из `src/AvailableModels.txt`.
 - **Генерация изображений через Qwen Chat**: `POST /api/images/generations` без `DASHSCOPE_API_KEY`.
 - **Генерация видео через Qwen Chat**: `POST /api/videos/generations` + polling задач через `GET /api/tasks/status/:taskId`.
 - **Мультиаккаунты**: добавление, перелогин, удаление, статусы `OK` / `WAIT` / `INVALID`, автоматическая round-robin ротация при лимитах.
@@ -52,6 +52,10 @@ npm run smoke
 ```text
 http://localhost:3264/api
 ```
+
+> 📖 **Полная инструкция по эксплуатации** — запуск, аккаунты, конфигурация,
+> несколько инстансов/воркеров, лимиты Qwen и устранение неполадок: смотрите
+> [docs/OPERATION_GUIDE.md](docs/OPERATION_GUIDE.md).
 
 ## Настройка через `.env`
 
@@ -88,6 +92,30 @@ npm run auth -- --remove
 ```
 
 При добавлении аккаунта откроется Chromium. Войдите в Qwen Chat, затем вернитесь в терминал — токен будет сохранён в `session/`.
+
+### Мультиаккаунты: массовый импорт токенов
+
+Для «много акков за раз» не нужно открывать браузер для каждого — достаточно импортировать токены (bearer JWT из аккаунта Qwen):
+
+```bash
+npm run auth -- --import tokens.txt
+```
+
+Формат `tokens.txt` — по одному токену на строку (пустые строки и строки с `#` игнорируются), можно именовать аккаунты `имя=токен`, либо передать JSON-массив строк или `[{"token": "...", "id": "alice"}]`.
+
+Проверить токены сразу лёгким ping (без создания чатов):
+
+```bash
+npm run auth -- --import tokens.txt --check
+```
+
+`--check` помечает недействительные токены (`UNAUTHORIZED`) как `invalid`, залимиченные (`RATELIMIT`) — на сброс, транзиентные ошибки (`ERROR`, WAF/сеть) не трогает — ровно как фоновый token healthcheck. Дубликаты пропускаются автоматически.
+
+Токены можно импортировать и напрямую, без npm:
+
+```bash
+node scripts/importTokens.js tokens.txt --check
+```
 
 **Не коммитьте и не публикуйте секреты:**
 
@@ -536,11 +564,11 @@ services:
 
 ## Рекомендуемые модели
 
-- **Обычный чат / агенты**: `qwen3.7-max`
+- **Обычный чат / агенты**: `qwen3.8-max` (самая свежая, дефолт эндпоинта)
 - **Быстрее и легче**: `qwen3.7-plus`
 - **Кодинг**: `qwen3-coder-plus`
 - **Изображения/видео через Qwen Chat**: `qwen3-vl-plus`
-- **Open WebUI default**: `qwen3.7-max`
+- **Open WebUI default**: `qwen3.8-max`
 
 ## Полезные команды
 

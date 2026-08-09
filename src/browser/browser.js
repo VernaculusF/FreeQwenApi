@@ -3,13 +3,17 @@ import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { saveSession, saveAuthToken } from './session.js';
 import { startManualAuthentication } from './auth.js';
 import { clearPagePool, getAuthToken } from '../api/chat.js';
+import { pingQwenTokenWithRetry } from '../api/qwenPing.js';
 import fs from 'fs';
 import path from 'path';
 import { logInfo, logError, logWarn, logDebug } from '../logger/index.js';
 import {
     CHAT_PAGE_URL, NAVIGATION_TIMEOUT, RETRY_DELAY, PROTOCOL_TIMEOUT,
     VIEWPORT_WIDTH, VIEWPORT_HEIGHT, USER_AGENT,
-    SESSION_DIR, ACCOUNTS_DIR
+    SESSION_DIR, ACCOUNTS_DIR,
+    NON_INTERACTIVE,
+    BROWSER_WATCHDOG_INTERVAL, BROWSER_WATCHDOG_PROBE_TIMEOUT, BROWSER_WATCHDOG_MAX_BACKOFF,
+    BROWSER_AUTH_TTL_MS
 } from '../config.js';
 
 puppeteer.use(StealthPlugin());
@@ -18,11 +22,146 @@ let browserInstance = null;
 let browserContext = null;
 export let isAuthenticated = false;
 
+// ─── Page helpers ────────────────────────────────────────────────────────────
+
+// Создаёт рабочую страницу из контекста/страницы браузера. Вынесена сюда,
+// чтобы chat.js и qwenPing.js делили одну реализацию без циклических импортов.
+export async function getPageFromContext(context) {
+    if (context && typeof context.newPage === 'function') {
+        return await context.newPage();
+    }
+
+    if (context && typeof context.goto === 'function') {
+        // Если передана Puppeteer Page, не переиспользуем её как рабочую:
+        // создаём отдельную вкладку из того же браузера, чтобы избежать гонок
+        // и случайного закрытия базовой страницы.
+        if (typeof context.browser === 'function') {
+            try {
+                const browser = context.browser();
+                if (browser && typeof browser.newPage === 'function') {
+                    return await browser.newPage();
+                }
+            } catch (error) {
+                logWarn(`Не удалось создать новую страницу из текущего контекста: ${error.message}`);
+            }
+        }
+
+        if (typeof context.isClosed === 'function' && context.isClosed()) {
+            throw new Error('Базовая страница браузера закрыта');
+        }
+
+        return context;
+    }
+
+    throw new Error('Неверный контекст: не страница Puppeteer, не контекст Playwright');
+}
+
+// ─── Watchdog браузера ────────────────────────────────────────────────────────
+let watchdogTimer = null;
+let watchdogActive = false;
+let watchdogRestartFailures = 0;
+let browserVisibleMode = false;
+let watchdogShuttingDown = false;
+
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+function isBrowserHealthy() {
+    if (!browserInstance) return false;
+    try {
+        if (typeof browserInstance.isConnected === 'function' && !browserInstance.isConnected()) return false;
+        const proc = typeof browserInstance.process === 'function' ? browserInstance.process() : null;
+        if (proc && proc.exitCode !== null) return false; // Chromium упал (OOM/kill)
+    } catch {
+        return false;
+    }
+    if (!browserContext) return false;
+    try {
+        if (typeof browserContext.isClosed === 'function' && browserContext.isClosed()) return false;
+    } catch {
+        return false;
+    }
+    return true;
+}
+
+async function isBrowserFullyHealthy() {
+    if (!isBrowserHealthy()) return false;
+    // Лёгкий probe базовой страницы: если рендерер завис или CDP оборвался,
+    // evaluate упадёт/зависнет — считаем браузер нездоровым.
+    try {
+        await Promise.race([
+            browserContext.evaluate(() => document.readyState),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('probe timeout')), BROWSER_WATCHDOG_PROBE_TIMEOUT))
+        ]);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+async function restartBrowserForWatchdog() {
+    logWarn('Watchdog: браузер не отвечает, перезапускаем...');
+    await shutdownBrowser();
+    // Всегда перезапускаем в headless: API-запросы не нуждаются в видимом окне,
+    // а интерактивная авторизация — отдельный пользовательский процесс, который
+    // не должен блокироваться watchdog-перезапуском (иначе — ожидание ENTER).
+    const ok = await initBrowser(false);
+    if (ok) {
+        logInfo('Watchdog: браузер успешно перезапущен');
+    } else {
+        logError('Watchdog: не удалось перезапустить браузер; следующая попытка с увеличенным интервалом');
+    }
+    return ok;
+}
+
+function scheduleWatchdogTick(delayMs) {
+    if (watchdogShuttingDown) return;
+    watchdogTimer = setTimeout(async () => {
+        if (watchdogShuttingDown) return;
+        let nextDelay = delayMs;
+        if (watchdogActive || !browserInstance) {
+            scheduleWatchdogTick(nextDelay);
+            return;
+        }
+        const healthy = await isBrowserFullyHealthy();
+        if (healthy) {
+            watchdogRestartFailures = 0;
+            nextDelay = BROWSER_WATCHDOG_INTERVAL;
+        } else {
+            watchdogActive = true;
+            try {
+                const ok = await restartBrowserForWatchdog();
+                watchdogRestartFailures = ok ? 0 : watchdogRestartFailures + 1;
+                nextDelay = ok
+                    ? BROWSER_WATCHDOG_INTERVAL
+                    : Math.min(BROWSER_WATCHDOG_INTERVAL * Math.pow(2, watchdogRestartFailures), BROWSER_WATCHDOG_MAX_BACKOFF);
+            } finally {
+                watchdogActive = false;
+            }
+        }
+        scheduleWatchdogTick(nextDelay);
+    }, delayMs);
+    if (typeof watchdogTimer.unref === 'function') watchdogTimer.unref();
+}
+
+export function startBrowserWatchdog() {
+    if (watchdogTimer) return;
+    watchdogShuttingDown = false;
+    logInfo(`Watchdog браузера запущен (интервал ${Math.round(BROWSER_WATCHDOG_INTERVAL / 1000)}с)`);
+    scheduleWatchdogTick(BROWSER_WATCHDOG_INTERVAL);
+}
+
+export function stopBrowserWatchdog() {
+    watchdogShuttingDown = true;
+    if (watchdogTimer) {
+        clearTimeout(watchdogTimer);
+        watchdogTimer = null;
+    }
+}
 
 export async function initBrowser(visibleMode = true, skipManualRestart = false) {
     if (browserInstance) return true;
 
+    browserVisibleMode = visibleMode;
     logInfo('Инициализация браузера с Puppeteer Stealth...');
     try {
         browserInstance = await puppeteer.launch({
@@ -102,6 +241,13 @@ export async function initBrowser(visibleMode = true, skipManualRestart = false)
         browserContext = page;
         logInfo('Браузер инициализирован с максимальной защитой от обнаружения');
 
+        if (!visibleMode) {
+            // Qwen WAF пропускает API-запросы только с cookies сессии (x5sec и др.):
+            // без них headless-запросы блокируются анти-ботом. Подгружаем
+            // сохранённые при ручной авторизации cookies в headless-браузер.
+            await loadSessionCookiesIntoBrowser(browserInstance);
+        }
+
         if (visibleMode) {
             await startManualAuthenticationPuppeteer(page, skipManualRestart);
         }
@@ -133,7 +279,137 @@ async function saveSessionPuppeteer(page) {
     }
 }
 
+// Загружает сохранённые cookies сессий (session/accounts/*/cookies.json) в
+// браузер. При ручной авторизации cookies НЕ подмешиваем — пользователь входит
+// заново и получает свежую сессию.
+async function loadSessionCookiesIntoBrowser(browser) {
+    try {
+        const accountsDir = path.join(process.cwd(), SESSION_DIR, ACCOUNTS_DIR);
+        if (!fs.existsSync(accountsDir)) return;
+        const cookies = [];
+        for (const dirName of fs.readdirSync(accountsDir)) {
+            const cookieFile = path.join(accountsDir, dirName, 'cookies.json');
+            if (!fs.existsSync(cookieFile)) continue;
+            try {
+                const parsed = JSON.parse(fs.readFileSync(cookieFile, 'utf8'));
+                for (const c of Array.isArray(parsed) ? parsed : []) {
+                    if (!c || typeof c.name !== 'string' || typeof c.value !== 'string' || typeof c.domain !== 'string') continue;
+                    cookies.push({
+                        name: c.name,
+                        value: c.value,
+                        domain: c.domain,
+                        path: typeof c.path === 'string' ? c.path : '/',
+                        secure: Boolean(c.secure),
+                        httpOnly: Boolean(c.httpOnly),
+                        sameSite: ['Strict', 'Lax', 'None'].includes(c.sameSite) ? c.sameSite : 'Lax',
+                        expires: typeof c.expires === 'number' && c.expires > 0 ? c.expires : -1
+                    });
+                }
+            } catch { /* битый файл cookies — пропускаем */ }
+        }
+        if (cookies.length > 0) {
+            await browser.setCookie(...cookies);
+            logInfo(`Загружено ${cookies.length} cookies сессий в headless-браузер`);
+        }
+    } catch (error) {
+        logWarn(`Не удалось загрузить cookies сессий: ${error.message}`);
+    }
+}
+
+const LOGIN_POLL_MS = 5000;
+// Сразу после открытия страницы в storage уже лежит гостевой JWT Qwen Studio.
+// Пинговать его до логина бессмысленно: получим WAF/отказ и будем крутить
+// цикл открытия вкладок. Первые LOGIN_PING_GRACE_MS просто ждём (пользователь
+// входит), потом пингуем только новые значения токена.
+const LOGIN_PING_GRACE_MS = 20000;
+// Если анти-бот (WAF) блокирует ping'и, бесконечно крутить автопроверку
+// бессмысленно: гостевые JWT меняются при каждой навигации. После этого числа
+// неудачных подтверждений продолжаем с токеном из браузера (как при ENTER)
+// с предупреждением.
+const MAX_UNCONFIRMED_LOGIN_PINGS = 3;
+
+// Читает токен из localStorage/sessionStorage страницы. Общий код для ручной
+// авторизации и автодетекта входа.
+async function readTokenFromStorage(page) {
+    try {
+        return await page.evaluate(() => {
+            const directKeys = ['token', 'auth_token', 'access_token', 'id_token', 'qwen_token'];
+            for (const key of directKeys) {
+                const value = localStorage.getItem(key) || sessionStorage.getItem(key);
+                if (value) return value;
+            }
+            const jwtLike = /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/;
+            for (const storage of [localStorage, sessionStorage]) {
+                for (let i = 0; i < storage.length; i += 1) {
+                    const value = storage.getItem(storage.key(i)) || '';
+                    const match = value.match(jwtLike);
+                    if (match) return match[0];
+                }
+            }
+            return null;
+        });
+    } catch (error) {
+        logWarn(`Не удалось прочитать localStorage/sessionStorage: ${error.message}`);
+        return null;
+    }
+}
+
+// Ждёт либо появления токена в storage, подтверждённого реальным ping'ом
+// (Qwen Studio выдаёт гостевые JWT анонимам — «токен есть» ещё не значит
+// «вошли»), либо принудительного ENTER в консоли. Возвращает подтверждённый
+// токен, либо null, если пользователь нажал ENTER.
+async function waitForLoginOrEnter(page) {
+    const pingedTokens = new Set();
+    let finished = false;
+
+    const onData = (key) => {
+        if (key === '\n' || key === '\r' || key.charCodeAt(0) === 13) {
+            finished = true;
+        }
+    };
+    if (process.stdin.isTTY) process.stdin.setRawMode(false);
+    process.stdin.resume();
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', onData);
+
+    let confirmedToken = null;
+    let unconfirmedPings = 0;
+    const startedAt = Date.now();
+    try {
+        while (!finished) {
+            const token = await readTokenFromStorage(page);
+            const inGrace = Date.now() - startedAt < LOGIN_PING_GRACE_MS;
+            if (token && !pingedTokens.has(token) && !inGrace) {
+                pingedTokens.add(token);
+                const raw = await pingQwenTokenWithRetry(token);
+                if (raw === 'OK' || raw === 'RATELIMIT') {
+                    confirmedToken = token;
+                    finished = true;
+                } else {
+                    unconfirmedPings++;
+                    logDebug(`Ожидание входа: токен не подтверждён (${raw}), продолжаем ждать...`);
+                    if (unconfirmedPings >= MAX_UNCONFIRMED_LOGIN_PINGS) {
+                        logWarn('Анти-бот (WAF) блокирует автопроверку токена. Продолжаем с токеном из браузера. Если вы НЕ вошли в аккаунт — остановите скрипт (Ctrl+C) и повторите.');
+                        finished = true;
+                    }
+                }
+            }
+            if (!finished) await delay(LOGIN_POLL_MS);
+        }
+    } finally {
+        try {
+            process.stdin.pause();
+            process.stdin.removeListener('data', onData);
+        } catch { /* stdin может быть уже закрыт */ }
+    }
+    return confirmedToken;
+}
+
 async function startManualAuthenticationPuppeteer(page, skipManualRestart) {
+    if (NON_INTERACTIVE) {
+        logError('NON_INTERACTIVE: ручная авторизация в видимом браузере недоступна. Запустите авторизацию в интерактивном режиме.');
+        throw new Error('NON_INTERACTIVE: ручная авторизация невозможна');
+    }
     try {
         logInfo('Открытие страницы для ручной авторизации...');
         await page.goto(CHAT_PAGE_URL, { waitUntil: 'networkidle2', timeout: NAVIGATION_TIMEOUT });
@@ -147,24 +423,17 @@ async function startManualAuthenticationPuppeteer(page, skipManualRestart) {
         console.log('2. ВАЖНО: Двигайте мышью естественно, не спешите');
         console.log('3. Если появится слайдер капчи - решите её медленно');
         console.log('4. Дождитесь полной загрузки главной страницы');
-        console.log('5. После успешной авторизации нажмите ENTER в консоли');
         console.log('------------------------------------------------------');
-        console.log('После успешной авторизации нажмите ENTER для продолжения...');
+        console.log('Окно закроется САМО, как только вход будет обнаружен и токен');
+        console.log('подтверждён (обычно через 5-30 секунд после логина).');
+        console.log('Можно нажать ENTER в консоли, чтобы продолжить сразу.');
 
-        await new Promise((resolve) => {
-            if (process.stdin.isTTY) process.stdin.setRawMode(false);
-            process.stdin.resume();
-            process.stdin.setEncoding('utf8');
-            const onData = (key) => {
-                if (key === '\n' || key === '\r' || key.charCodeAt(0) === 13) {
-                    process.stdin.pause();
-                    process.stdin.removeListener('data', onData);
-                    logInfo('Получено подтверждение, продолжаем...');
-                    resolve();
-                }
-            };
-            process.stdin.on('data', onData);
-        });
+        const confirmedToken = await waitForLoginOrEnter(page);
+        if (confirmedToken) {
+            logInfo('Вход обнаружен автоматически: токен подтверждён ping\'ом.');
+        } else {
+            logInfo('Получено подтверждение, продолжаем...');
+        }
 
         let cookies = [];
         try {
@@ -174,31 +443,10 @@ async function startManualAuthenticationPuppeteer(page, skipManualRestart) {
             logWarn(`Не удалось прочитать cookies после ручной авторизации: ${error.message}`);
         }
 
-        let token = null;
-        try {
-            token = await page.evaluate(() => {
-                const directKeys = ['token', 'auth_token', 'access_token', 'id_token', 'qwen_token'];
-                for (const key of directKeys) {
-                    const value = localStorage.getItem(key) || sessionStorage.getItem(key);
-                    if (value) return value;
-                }
-                const jwtLike = /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/;
-                for (const storage of [localStorage, sessionStorage]) {
-                    for (let i = 0; i < storage.length; i += 1) {
-                        const value = storage.getItem(storage.key(i)) || '';
-                        const match = value.match(jwtLike);
-                        if (match) return match[0];
-                    }
-                }
-                return null;
-            });
-        } catch (error) {
-            logWarn(`Не удалось прочитать localStorage/sessionStorage: ${error.message}`);
-        }
-
-        if (token) {
+        let sessionToken = confirmedToken || await readTokenFromStorage(page);
+        if (sessionToken) {
             logInfo('Токен найден и будет сохранен');
-            saveAuthToken(token);
+            saveAuthToken(sessionToken);
         } else {
             logWarn('Токен не найден в localStorage/sessionStorage');
             logInfo('Попытка извлечь токен из cookies...');
@@ -206,7 +454,28 @@ async function startManualAuthenticationPuppeteer(page, skipManualRestart) {
             if (tokenCookie) {
                 logInfo(`Токен найден в cookie: ${tokenCookie.name}`);
                 saveAuthToken(tokenCookie.value);
+                sessionToken = tokenCookie.value;
             }
+        }
+
+        // Qwen Studio выдаёт гостевые JWT анонимам: наличие токена само по себе
+        // вход не доказывает. «Авторизован» ставится только после подтверждения
+        // токена реальным ping'ом.
+        if (sessionToken && sessionToken !== confirmedToken) {
+            const raw = await pingQwenTokenWithRetry(sessionToken);
+            if (raw === 'OK' || raw === 'RATELIMIT') {
+                logInfo(`Сессия подтверждена ping'ом (${raw}).`);
+                setAuthenticationStatus(true);
+            } else {
+                logWarn(`Токен не подтверждён (${raw}): статус авторизации НЕ ставится. Если вы вошли — повторите авторизацию или дождитесь повторной проверки.`);
+                setAuthenticationStatus(false);
+            }
+        } else if (sessionToken) {
+            logInfo('Сессия подтверждена ping\'ом (OK).');
+            setAuthenticationStatus(true);
+        } else {
+            logWarn('Токен авторизации не найден после входа.');
+            setAuthenticationStatus(false);
         }
 
         try {
@@ -216,8 +485,7 @@ async function startManualAuthenticationPuppeteer(page, skipManualRestart) {
             logWarn(`Не удалось сохранить cookies-сессию: ${error.message}`);
         }
 
-        setAuthenticationStatus(true);
-        logInfo('Авторизация завершена успешно');
+        logInfo('Ручная авторизация завершена');
 
         if (!skipManualRestart) await restartBrowserInHeadlessMode();
     } catch (error) {
@@ -255,5 +523,34 @@ export async function shutdownBrowser() {
 }
 
 export function getBrowserContext() { return browserContext; }
-export function setAuthenticationStatus(status) { isAuthenticated = status; }
-export function getAuthenticationStatus() { return isAuthenticated; }
+
+// True, когда браузер запущен в видимом режиме (ручная авторизация, верификация).
+// В этом режиме нельзя создавать дополнительные вкладки под капотом: пользователь
+// видит их открытие/закрытие, а WAF считает такое поведение подозрительным.
+export function isBrowserVisibleMode() { return browserVisibleMode; }
+
+// ─── Кэш-флаг авторизации с TTL ───────────────────────────────────────────────
+// isAuthenticated подтверждается ping'ом токена и «протухает» через
+// BROWSER_AUTH_TTL_MS: после истечения getAuthenticationStatus() возвращает
+// false, и следующая проверка (checkAuthentication) перепроверит сессию,
+// вместо того чтобы вечно считать истёкшую сессию живой.
+let authConfirmedAt = 0;
+
+/**
+ * Чистая проверка «подтверждена ли сессия» по времени подтверждения (для тестов).
+ * ttlMs <= 0 — TTL отключён: подтверждение не протухает.
+ */
+export function isAuthConfirmed(confirmedAt, ttlMs, now = Date.now()) {
+    if (confirmedAt <= 0) return false;
+    return ttlMs <= 0 || (now - confirmedAt) <= ttlMs;
+}
+
+export function setAuthenticationStatus(status) {
+    isAuthenticated = Boolean(status);
+    authConfirmedAt = status ? Date.now() : 0;
+}
+
+export function getAuthenticationStatus() {
+    if (!isAuthenticated) return false;
+    return isAuthConfirmed(authConfirmedAt, BROWSER_AUTH_TTL_MS);
+}

@@ -24,7 +24,7 @@ test('Node runtime defaults to the current Qwen model when no override is set', 
     { cwd, env: cleanEnv, encoding: 'utf8' }
   );
 
-  assert.equal(stdout, 'qwen3.7-max');
+  assert.equal(stdout, 'qwen3.8-max');
 });
 
 test('Node runtime binds to loopback unless HOST is explicitly configured', (t) => {
@@ -55,7 +55,7 @@ test('Python runtime has the same configurable default model', () => {
   const pythonSource = readFileSync(path.join(projectRoot, 'main.py'), 'utf8');
   assert.match(
     pythonSource,
-    /DEFAULT_MODEL\s*=\s*os\.environ\.get\("DEFAULT_MODEL",\s*"qwen3\.7-max"\)/
+    /DEFAULT_MODEL\s*=\s*os\.environ\.get\("DEFAULT_MODEL",\s*"qwen3\.8-max"\)/
   );
   assert.match(
     pythonSource,
