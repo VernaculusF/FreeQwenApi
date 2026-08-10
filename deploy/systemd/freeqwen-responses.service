@@ -1,0 +1,25 @@
+[Unit]
+Description=FreeQwen Responses API bridge for Codex
+After=network-online.target freeqwen-a.service freeqwen-b.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/freeqwen
+Environment=HOST=127.0.0.1
+Environment=PORT=3270
+Environment=QWEN_UPSTREAMS=http://127.0.0.1:3264/api/v1/chat/completions,http://127.0.0.1:3265/api/v1/chat/completions
+Environment=QWEN_API_KEY_FILE=/opt/freeqwen/src/Authorization.txt
+Environment=BRIDGE_LOG_IDENTITIES=1
+Environment=BRIDGE_AFFINITY_TTL_MS=86400000
+Environment=BRIDGE_MAX_AFFINITIES=4096
+ExecStart=/opt/node/bin/node /opt/freeqwen/scripts/codex_responses_bridge.js
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

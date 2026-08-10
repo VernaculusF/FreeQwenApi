@@ -6,8 +6,10 @@ import {
     classifyPingResult,
     classifyPingResponse,
     pingQwenTokenWithRetry,
-    buildQwenRequestHeaders
+    buildQwenRequestHeaders,
+    buildPingRequest
 } from '../src/api/qwenPing.js';
+import { CHAT_API_URL, CREATE_CHAT_URL, CHAT_LIST_URL, DEFAULT_MODEL } from '../src/config.js';
 import {
     isWafHtmlBlock,
     isAntiBotBody,
@@ -116,6 +118,71 @@ test('classifyPingResponse: обычные статусы без капчи', ()
     assert.equal(classifyPingResponse({ ok: false, status: 502 }), 'ERROR');
     assert.equal(classifyPingResponse({ ok: false, status: 0 }), 'ERROR');
     assert.equal(classifyPingResponse({}), 'ERROR');
+});
+
+test('classifyPingResponse: 200 с JSON success:false — ERROR, а не OK (create-chat отказ)', () => {
+    assert.equal(classifyPingResponse({ ok: true, status: 200, body: '{"success":false,"error":"model unavailable"}' }), 'ERROR');
+    // Успешный create-chat ответ остаётся OK
+    assert.equal(classifyPingResponse({ ok: true, status: 200, body: '{"success":true,"data":{"id":"chat-1"}}' }), 'OK');
+    // JSON без поля success не затронут
+    assert.equal(classifyPingResponse({ ok: true, status: 200, body: '{"choices":[]}' }), 'OK');
+});
+
+test('classifyPingResponse: реальная форма отказа GET /api/v2/chats (success:false + unauthorized) → UNAUTHORIZED', () => {
+    // Именно так Qwen отвечает невалидному токену на read-only список чатов:
+    // HTTP 200, success:false, code "unauthorized", детали про истёкшую сессию.
+    const realShape = JSON.stringify({
+        success: false,
+        request_id: 'abc-123',
+        data: { code: 'unauthorized', details: 'Your session has expired, or the token is no longer valid. Please sign in again to proceed.' }
+    });
+    assert.equal(classifyPingResponse({ ok: true, status: 200, body: realShape }), 'UNAUTHORIZED');
+    // rate-limit в той же обёртке
+    assert.equal(classifyPingResponse({ ok: true, status: 200, body: '{"success":false,"data":{"code":"RateLimited"}}' }), 'RATELIMIT');
+});
+
+test('classifyPingResponse: 200 с success:true — OK сразу, даже если в data есть слово unauthorized (список чатов)', () => {
+    // Заголовок чата пользователя может содержать что угодно — явный success:true
+    // важнее текстовых эвристик по телу.
+    const listWithOddTitle = JSON.stringify({ success: true, request_id: 'r1', data: [{ id: 'c1', title: 'Unauthorized access question' }] });
+    assert.equal(classifyPingResponse({ ok: true, status: 200, body: listWithOddTitle }), 'OK');
+});
+
+// ─── buildPingRequest (форма запроса ping) ───────────────────────────────────
+
+test('buildPingRequest: по умолчанию list_chats — read-only GET списка чатов (ничего не создаёт)', () => {
+    const req = buildPingRequest('tok');
+    assert.equal(req.method, 'GET');
+    assert.equal(req.apiUrl, CHAT_LIST_URL);
+    assert.equal(req.credentials, 'same-origin');
+    assert.equal(req.headers.Authorization, 'Bearer tok');
+    // Нет тела — это read-only запрос: никаких чатов не создаётся.
+    assert.equal(req.payload, null);
+});
+
+test('buildPingRequest: mode=create_chat возвращает POST /chats/new (запасная форма)', () => {
+    const req = buildPingRequest('tok', { mode: 'create_chat', now: () => 123456789 });
+    assert.equal(req.method, 'POST');
+    assert.equal(req.apiUrl, CREATE_CHAT_URL);
+    assert.equal(req.credentials, 'same-origin');
+    assert.equal(req.headers.Authorization, 'Bearer tok');
+    assert.deepEqual(req.payload, {
+        title: 'freeqwen-ping',
+        models: [DEFAULT_MODEL],
+        chat_mode: 'normal',
+        chat_type: 't2t',
+        timestamp: 123456789
+    });
+});
+
+test('buildPingRequest: mode=completions возвращает legacy-форму (прямой POST без chat_id)', () => {
+    const req = buildPingRequest('tok', { mode: 'completions', now: () => 0 });
+    assert.equal(req.method, 'POST');
+    assert.equal(req.apiUrl, CHAT_API_URL);
+    assert.equal(req.payload.stream, false);
+    assert.equal(req.payload.messages[0].content, 'ping');
+    // create-chat полей нет
+    assert.equal('models' in req.payload, false);
 });
 
 // ─── pingQwenTokenWithRetry (единая политика retry) ─────────────────────────

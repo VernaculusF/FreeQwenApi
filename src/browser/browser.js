@@ -22,6 +22,12 @@ let browserInstance = null;
 let browserContext = null;
 export let isAuthenticated = false;
 
+// Изолированные контексты аккаунтов: у каждого аккаунта свои cookies (x5sec,
+// nc_sig и т.п.), и смешивать их в одном браузере нельзя — WAF видит «чужую»
+// сессию и челленджит запрос. Контекст создаётся лениво для аккаунта с
+// сохранённой cookie-сессией (session/accounts/<id>/cookies.json).
+const accountContexts = new Map(); // accountId -> Puppeteer BrowserContext
+
 // ─── Page helpers ────────────────────────────────────────────────────────────
 
 // Создаёт рабочую страницу из контекста/страницы браузера. Вынесена сюда,
@@ -279,6 +285,67 @@ async function saveSessionPuppeteer(page) {
     }
 }
 
+// Загружает cookies ОДНОГО аккаунта (session/accounts/<id>/cookies.json) в
+// указанный контекст браузера. Возвращает число загруженных cookies.
+async function loadAccountCookiesIntoContext(context, accountId) {
+    const cookieFile = path.join(process.cwd(), SESSION_DIR, ACCOUNTS_DIR, accountId, 'cookies.json');
+    if (!fs.existsSync(cookieFile)) return 0;
+    let cookies = [];
+    try {
+        const parsed = JSON.parse(fs.readFileSync(cookieFile, 'utf8'));
+        for (const c of Array.isArray(parsed) ? parsed : []) {
+            if (!c || typeof c.name !== 'string' || typeof c.value !== 'string' || typeof c.domain !== 'string') continue;
+            cookies.push({
+                name: c.name,
+                value: c.value,
+                domain: c.domain,
+                path: typeof c.path === 'string' ? c.path : '/',
+                secure: Boolean(c.secure),
+                httpOnly: Boolean(c.httpOnly),
+                sameSite: ['Strict', 'Lax', 'None'].includes(c.sameSite) ? c.sameSite : 'Lax',
+                expires: typeof c.expires === 'number' && c.expires > 0 ? c.expires : -1
+            });
+        }
+    } catch { /* битый файл cookies — пропускаем */ }
+    if (cookies.length === 0) return 0;
+    if (typeof context.setCookie === 'function') {
+        await context.setCookie(...cookies);
+    }
+    return cookies.length;
+}
+
+/**
+ * Контекст браузера для конкретного managed-аккаунта (session/accounts/<id>):
+ * отдельный инкогнито-контекст с cookies ТОЛЬКО этого аккаунта. Раньше все
+ * аккаунты жили в одном браузере и их cookies перемешивались — WAF видел
+ * токен одного аккаунта с cookies другого и челленджил всё подряд.
+ *
+ * Возвращает изолированный BrowserContext (у него есть newPage()), либо общий
+ * контекст, если у аккаунта нет сохранённой cookie-сессии или браузер недоступен.
+ */
+export async function getAccountBrowserContext(accountId) {
+    if (!accountId) return browserContext;
+    const existing = accountContexts.get(accountId);
+    if (existing) return existing;
+    if (!browserInstance || typeof browserInstance.createBrowserContext !== 'function') return browserContext;
+    const cookieFile = path.join(process.cwd(), SESSION_DIR, ACCOUNTS_DIR, accountId, 'cookies.json');
+    if (!fs.existsSync(cookieFile)) return browserContext;
+    try {
+        const context = await browserInstance.createBrowserContext();
+        const loaded = await loadAccountCookiesIntoContext(context, accountId);
+        accountContexts.set(accountId, context);
+        if (loaded > 0) {
+            logInfo(`Аккаунт ${accountId}: изолированный контекст, загружено ${loaded} cookies`);
+        } else {
+            logWarn(`Аккаунт ${accountId}: изолированный контекст без cookies (файл пуст)`);
+        }
+        return context;
+    } catch (e) {
+        logWarn(`Аккаунт ${accountId}: не удалось создать изолированный контекст (${e.message?.slice(0, 80)}) — используем общий`);
+        return browserContext;
+    }
+}
+
 // Загружает сохранённые cookies сессий (session/accounts/*/cookies.json) в
 // браузер. При ручной авторизации cookies НЕ подмешиваем — пользователь входит
 // заново и получает свежую сессию.
@@ -507,6 +574,15 @@ export async function restartBrowserInHeadlessMode() {
 export async function shutdownBrowser() {
     try {
         try { await clearPagePool(); } catch (e) { logError('Ошибка при очистке пула страниц', e); }
+        // Изолированные контексты аккаунтов закрываем ДО browserInstance.close().
+        for (const [accountId, context] of accountContexts) {
+            try {
+                await context.close();
+            } catch (e) {
+                logWarn(`Ошибка при закрытии контекста аккаунта ${accountId}: ${e.message?.slice(0, 80)}`);
+            }
+        }
+        accountContexts.clear();
         if (browserInstance) {
             try {
                 const pages = await browserInstance.pages();

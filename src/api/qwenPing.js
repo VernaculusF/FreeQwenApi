@@ -1,8 +1,13 @@
 // qwenPing.js — единый модуль лёгкого ping Qwen и классификации ответов.
 //
 // Консолидирует:
-//   - pingQwenToken()            — бывший testToken из chat.js: лёгкий запрос
-//                                  в Qwen Chat из браузерного контекста;
+//   - buildPingRequest()         — чистая сборка запроса ping: по умолчанию
+//                                  list_chats (read-only GET списка чатов —
+//                                  реальная форма трафика web-клиента, проходит
+//                                  WAF и ничего не создаёт); create_chat и
+//                                  legacy completions — за флагом QWEN_PING_MODE;
+//   - pingQwenToken()            — лёгкий запрос в Qwen Chat из браузерного
+//                                  контекста;
 //   - classifyQwenError()        — единая классификация 401/429 (используется
 //                                  в chat.js для ответов на chat-запросы);
 //   - classifyPingResult()       — маппинг сырого результата ping в статус;
@@ -20,8 +25,8 @@ import { withOperationGuard } from '../utils/operationGuard.js';
 import { isWafHtmlBlock } from '../utils/verificationMarkers.js';
 import { logWarn, logError } from '../logger/index.js';
 import {
-    CHAT_PAGE_URL, CHAT_API_URL, DEFAULT_MODEL, PAGE_EVALUATE_TIMEOUT,
-    AUTH_STATUS_RETRY_COUNT, AUTH_STATUS_RETRY_DELAY_MS
+    CHAT_PAGE_URL, CHAT_API_URL, CREATE_CHAT_URL, CHAT_LIST_URL, DEFAULT_MODEL, PAGE_EVALUATE_TIMEOUT,
+    QWEN_PING_MODE, AUTH_STATUS_RETRY_COUNT, AUTH_STATUS_RETRY_DELAY_MS
 } from '../config.js';
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -101,14 +106,93 @@ export function classifyPingResponse({ ok = false, status = 0, body = null } = {
     const bodyText = typeof body === 'string' ? body : '';
     if (isWafHtmlBlock(bodyText)) return 'ERROR';
 
+    // 200-е с JSON-телом: явный `success` важнее текстовых эвристик и проверяется
+    // ДО classifyQwenError — иначе слово «Unauthorized» в заголовке чата из
+    // списка (success:true) ошибочно приняло бы токен за недействительный.
+    //   success:true  — определённо здоровый токен (список чатов, созданный чат);
+    //   success:false — сбой запроса: «unauthorized»/истёкшая сессия → UNAUTHORIZED,
+    //                   RateLimited → RATELIMIT, иначе ERROR. Именно так Qwen
+    //                   отвечает невалидному токену на GET /api/v2/chats.
+    if (status === 200 && bodyText.startsWith('{')) {
+        try {
+            const parsed = JSON.parse(bodyText);
+            if (parsed && parsed.success === true) return 'OK';
+            if (parsed && parsed.success === false) {
+                const { kind } = classifyQwenError({ status, errorBody: bodyText });
+                if (kind === 'unauthorized') return 'UNAUTHORIZED';
+                if (kind === 'ratelimit') return 'RATELIMIT';
+                return 'ERROR';
+            }
+        } catch { /* не JSON — дальше по обычным правилам */ }
+    }
+
     const { kind } = classifyQwenError({ status, errorBody: bodyText });
     if (kind === 'unauthorized') return 'UNAUTHORIZED';
     if (kind === 'ratelimit') return 'RATELIMIT';
 
     if (status === 401 || status === 403) return 'UNAUTHORIZED';
     if (status === 429) return 'RATELIMIT';
+
     if (ok || status === 400) return 'OK';
     return 'ERROR';
+}
+
+// ─── Форма запроса ping ────────────────────────────────────────────────────
+
+/**
+ * Собирает запрос ping токена (чистая функция для тестов).
+ *
+ * Форма по умолчанию — list_chats: GET /api/v2/chats/?page=1&exclude_project=true,
+ * ровно тот read-only запрос, которым web-клиент Qwen загружает список чатов
+ * при открытии страницы. Реальная форма трафика — гарантированно проходит
+ * анти-бот (проверено живьём) и ничего не создаёт: ни чатов, ни расхода квоты.
+ * Невалидному токену Qwen отвечает 200 с success:false и «unauthorized» —
+ * классифицируется как UNAUTHORIZED.
+ *
+ * create_chat — POST /api/v2/chats/new (форма, тоже проходящая WAF, но создающая
+ * пустой чат «freeqwen-ping» на каждую проверку); сохраняется за флагом
+ * QWEN_PING_MODE=create_chat как запасной вариант.
+ *
+ * Legacy-форма completions (прямой POST в /chat/completions без chat_id)
+ * сохраняется за флагом QWEN_PING_MODE=completions для отладки/отката.
+ */
+export function buildPingRequest(token, { mode = QWEN_PING_MODE, now = Date.now } = {}) {
+    const headers = buildQwenRequestHeaders(token);
+    const credentials = 'same-origin';
+
+    if (mode === 'completions') {
+        return {
+            method: 'POST',
+            apiUrl: CHAT_API_URL,
+            headers,
+            credentials,
+            payload: { chat_type: 't2t', messages: [{ role: 'user', content: 'ping', chat_type: 't2t' }], model: DEFAULT_MODEL, stream: false }
+        };
+    }
+
+    if (mode === 'create_chat') {
+        return {
+            method: 'POST',
+            apiUrl: CREATE_CHAT_URL,
+            headers,
+            credentials,
+            payload: {
+                title: 'freeqwen-ping',
+                models: [DEFAULT_MODEL],
+                chat_mode: 'normal',
+                chat_type: 't2t',
+                timestamp: now()
+            }
+        };
+    }
+
+    return {
+        method: 'GET',
+        apiUrl: CHAT_LIST_URL,
+        headers,
+        credentials,
+        payload: null
+    };
 }
 
 // ─── Ping токена ────────────────────────────────────────────────────────────
@@ -137,23 +221,16 @@ export async function pingQwenToken(token) {
             await page.goto(CHAT_PAGE_URL, { waitUntil: 'domcontentloaded' });
         }
 
-        const requestBody = {
-            apiUrl: CHAT_API_URL,
-            headers: buildQwenRequestHeaders(token),
-            // 'same-origin' отправляет cookies сессии — без них WAF Qwen блокирует
-            // даже ping (FAIL_SYS_USER_VALIDATE), и токен нельзя подтвердить.
-            credentials: 'same-origin',
-            payload: { chat_type: 't2t', messages: [{ role: 'user', content: 'ping', chat_type: 't2t' }], model: DEFAULT_MODEL, stream: false }
-        };
+        const requestBody = buildPingRequest(token);
 
         const result = await withOperationGuard(
             page.evaluate(async (data) => {
                 try {
                     const res = await fetch(data.apiUrl, {
-                        method: 'POST',
+                        method: data.method || 'POST',
                         credentials: data.credentials,
                         headers: data.headers,
-                        body: JSON.stringify(data.payload)
+                        body: data.payload ? JSON.stringify(data.payload) : undefined
                     });
                     // Захватываем начало тела: без него 200-я HTML-капча WAF
                     // неотличима от успешной проверки токена.

@@ -3,7 +3,8 @@ import { test } from 'node:test';
 
 import {
   buildAccountSwitchRetryArgs,
-  retryAfterAccountSwitch
+  retryAfterAccountSwitch,
+  retryAfterChallengeSolve
 } from '../src/api/chat.js';
 
 test('account-switch retry resets Qwen chat ownership and preserves agent context', async () => {
@@ -56,8 +57,17 @@ test('account-switch retry resets Qwen chat ownership and preserves agent contex
     onChunk,
     resetMessage,
     clientScope,
-    null
+    null,
+    false
   ]);
+});
+
+test('account-switch retry helper preserves forceBrowserFetch', async () => {
+  let receivedArgs;
+  await retryAfterAccountSwitch({ message: 'hello', model: 'qwen3.7-max', forceBrowserFetch: true }, (...args) => {
+    receivedArgs = args;
+  });
+  assert.equal(receivedArgs[16], true);
 });
 
 test('account-switch retry helper uses safe sendMessage defaults', () => {
@@ -77,8 +87,27 @@ test('account-switch retry helper uses safe sendMessage defaults', () => {
     null,
     null,
     null,
-    null
+    null,
+    false
   ]);
+});
+
+test('retry-after-challenge-solve keeps chat ownership and forces browser fetch', async () => {
+  let receivedArgs;
+  const requestContext = {
+    message: 'hello',
+    model: 'qwen3.7-max',
+    chatId: 'chat-xyz',
+    parentId: 'parent-xyz',
+    retryCount: 1
+  };
+  await retryAfterChallengeSolve(requestContext, (...args) => {
+    receivedArgs = args;
+  });
+  assert.equal(receivedArgs[2], 'chat-xyz', 'chatId сохраняется');
+  assert.equal(receivedArgs[3], 'parent-xyz', 'parentId сохраняется');
+  assert.equal(receivedArgs[11], 2, 'retryCount увеличивается');
+  assert.equal(receivedArgs[16], true, 'forceBrowserFetch включён');
 });
 
 test('account-switch retry rejects a missing sendMessage implementation', async () => {

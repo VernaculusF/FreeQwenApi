@@ -5,7 +5,7 @@ import { fileURLToPath } from 'url';
 import { initBrowser, shutdownBrowser, getBrowserContext } from '../browser/browser.js';
 import { extractAuthToken } from '../api/chat.js';
 import { loadTokens, saveTokens, markValid, removeToken } from '../api/tokenManager.js';
-import { loadAuthToken } from '../browser/session.js';
+import { loadAuthToken, saveSession } from '../browser/session.js';
 import { logInfo, logError, logWarn } from '../logger/index.js';
 import { prompt } from './prompt.js';
 import { formatForgetMeAiWatermark } from './branding.js';
@@ -46,11 +46,20 @@ export async function addAccountInteractive() {
         return null;
     }
 
-    await shutdownBrowser();
-
     const id = 'acc_' + Date.now();
     ensureAccountDir(id);
     fs.writeFileSync(path.resolve(__dirname, '..', '..', SESSION_DIR, ACCOUNTS_DIR, id, 'token.txt'), token, 'utf8');
+    // Cookies сессии сохраняем под ТЕМ ЖЕ id, что и токен (иначе аккаунт
+    // останется без своих cookies, а чужие перемешаются в общем браузере —
+    // WAF челленджит «токен A + cookies B»).
+    try {
+        await saveSession(getBrowserContext(), id);
+        logInfo(`Cookies сессии сохранены для аккаунта ${id}`);
+    } catch (e) {
+        logWarn(`Не удалось сохранить cookies для аккаунта ${id}: ${e.message?.slice(0, 80)}`);
+    }
+
+    await shutdownBrowser();
 
     const list = loadTokens();
     list.push({ id, token, resetAt: null });
@@ -99,9 +108,19 @@ export async function reloginAccountInteractive() {
     if (!ok) { logError('Не удалось запустить браузер.'); return; }
 
     const token = await extractAuthToken(getBrowserContext(), true);
-    await shutdownBrowser();
 
-    if (!token) { logError('Не удалось извлечь токен.'); return; }
+    if (!token) { await shutdownBrowser(); logError('Не удалось извлечь токен.'); return; }
+
+    // Обновляем и cookies под тем же id — новая сессия после перелогина
+    // должна заменить старую, а не осесть в «сиротском» каталоге.
+    try {
+        await saveSession(getBrowserContext(), account.id);
+        logInfo(`Cookies сессии обновлены для ${account.id}`);
+    } catch (e) {
+        logWarn(`Не удалось сохранить cookies для ${account.id}: ${e.message?.slice(0, 80)}`);
+    }
+
+    await shutdownBrowser();
 
     markValid(account.id, token);
     fs.writeFileSync(path.resolve(__dirname, '..', '..', SESSION_DIR, ACCOUNTS_DIR, account.id, 'token.txt'), token, 'utf8');

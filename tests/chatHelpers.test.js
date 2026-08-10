@@ -108,10 +108,11 @@ test('isQwenAntiBotBody detects Qwen JSON captcha challenge', () => {
   assert.equal(isQwenAntiBotBody(body), true);
 });
 
-test('HTTP anti-bot responses fall back to browser fetch unless Node fetch is forced', () => {
+test('HTTP anti-bot responses are surfaced for auto-solving, not hidden by fallback', () => {
   const challenge = { status: 403, errorBody: '<captcha>', antiBot: true };
 
-  assert.equal(shouldReturnNodeStreamingResponse(challenge, false), false);
+  // anti-bot всегда отдаём вверх (handleApiError решает слайдер и повторяет запрос)
+  assert.equal(shouldReturnNodeStreamingResponse(challenge, false), true);
   assert.equal(shouldReturnNodeStreamingResponse(challenge, true), true);
   assert.equal(shouldReturnNodeStreamingResponse({ ...challenge, hasStreamedChunks: true }, false), true);
   assert.equal(shouldReturnNodeStreamingResponse({ status: 429, errorBody: 'rate limit' }, false), true);

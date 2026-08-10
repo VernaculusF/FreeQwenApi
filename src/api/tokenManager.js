@@ -133,6 +133,78 @@ export function markRateLimitedByToken(tokenValue, hours = RATE_LIMIT_DEFAULT_HO
     return updated;
 }
 
+// ─── Счётчик операций на аккаунт (проактивная защита от бан-висения) ────────
+// Qwen держит запросы (бан-висение) после ~25-35 операций (создание чата +
+// сообщения) на аккаунт в скользящем окне, не возвращая 429. Считаем успешные
+// операции и паркуем аккаунт заранее, не давая дойти до бана. Счётчик
+// персистентный (session/ops.json), переживает рестарты; реактивная парковка
+// по таймауту остаётся страховкой на случай, если Qwen срежет раньше.
+import crypto from 'crypto';
+
+// Путь можно переопределить через env (тесты пишут во временный файл).
+const OPS_FILE = process.env.QWEN_OPS_FILE
+    ? path.resolve(process.env.QWEN_OPS_FILE)
+    : path.join(SESSION_PATH, 'ops.json');
+let opLog = null; // Map fingerprint(token) -> number[] (timestamps), лениво из файла
+const OPS_LOG_MAX = 20_000; // предохранитель от неограниченного роста
+
+function loadOpLog() {
+    if (opLog) return opLog;
+    opLog = new Map();
+    try {
+        const data = JSON.parse(fs.readFileSync(OPS_FILE, 'utf8'));
+        for (const [k, arr] of Object.entries(data)) {
+            if (Array.isArray(arr)) opLog.set(k, arr);
+        }
+    } catch { /* файла ещё нет */ }
+    return opLog;
+}
+
+function saveOpLog() {
+    try {
+        const obj = {};
+        for (const [k, arr] of loadOpLog()) {
+            if (arr.length) obj[k] = arr.slice(-OPS_LOG_MAX);
+        }
+        fs.writeFileSync(OPS_FILE, JSON.stringify(obj), 'utf8');
+    } catch (e) { logError('OpsLog: не удалось сохранить счётчик операций', e); }
+}
+
+export function opFingerprint(tokenValue) {
+    return typeof tokenValue === 'string' && tokenValue
+        ? crypto.createHash('sha256').update(tokenValue).digest('hex').slice(0, 16)
+        : '';
+}
+
+/** Записать успешную операцию (создание чата или сообщение). */
+export function recordOp(tokenValue, now = Date.now()) {
+    const key = opFingerprint(tokenValue);
+    if (!key) return;
+    const log = loadOpLog();
+    let arr = log.get(key);
+    if (!arr) { arr = []; log.set(key, arr); }
+    arr.push(now);
+    if (arr.length > OPS_LOG_MAX) arr.splice(0, arr.length - OPS_LOG_MAX);
+    saveOpLog();
+}
+
+/** Число операций аккаунта за последние windowMs (устаревшие отбрасываются). */
+export function countOps(tokenValue, windowMs, now = Date.now()) {
+    const arr = loadOpLog().get(opFingerprint(tokenValue));
+    if (!arr) return 0;
+    const cutoff = now - windowMs;
+    let i = 0;
+    while (i < arr.length && arr[i] < cutoff) i++;
+    if (i > 0) arr.splice(0, i);
+    return arr.length;
+}
+
+/** Превышен ли лимит операций (>= maxOps за окно)? */
+export function isOpsOverLimit(tokenValue, maxOps, windowMs, now = Date.now()) {
+    if (typeof maxOps !== 'number' || maxOps <= 0) return false;
+    return countOps(tokenValue, windowMs, now) >= maxOps;
+}
+
 export function removeToken(id) {
     saveTokens(loadTokens().filter(t => t.id !== id));
 }

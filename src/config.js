@@ -54,11 +54,30 @@ const QWEN_BASE_URL = process.env.QWEN_BASE_URL || 'https://chat.qwen.ai';
 
 export const CHAT_API_URL = process.env.CHAT_API_URL || `${QWEN_BASE_URL}/api/v2/chat/completions`;
 export const CREATE_CHAT_URL = process.env.CREATE_CHAT_URL || `${QWEN_BASE_URL}/api/v2/chats/new`;
+// Read-only запрос списка чатов — та же форма, что web-клиент Qwen делает при
+// открытии страницы (реальный трафик, проходит анти-бот). Используется ping'ом
+// токена: ничего не создаёт и квоту сообщений не расходует.
+export const CHAT_LIST_URL = process.env.CHAT_LIST_URL || `${QWEN_BASE_URL}/api/v2/chats/?page=1&exclude_project=true`;
 export const CHAT_PAGE_URL = process.env.CHAT_PAGE_URL || `${QWEN_BASE_URL}/`;
 export const TASK_STATUS_URL = process.env.TASK_STATUS_URL || `${QWEN_BASE_URL}/api/v1/tasks/status`;
 export const STS_TOKEN_API_URL = process.env.STS_TOKEN_API_URL || `${QWEN_BASE_URL}/api/v1/files/getstsToken`;
 export const AUTH_SIGNIN_URL = process.env.AUTH_SIGNIN_URL || `${QWEN_BASE_URL}/auth?action=signin`;
 export const OSS_SDK_URL = process.env.OSS_SDK_URL || 'https://gosspublic.alicdn.com/aliyun-oss-sdk-6.20.0.min.js';
+
+// ─── Форма ping токена ───────────────────────────────────────────────────────
+// list_chats (по умолчанию) — GET /api/v2/chats/?page=1&exclude_project=true:
+// read-only запрос, которым сам web-клиент Qwen загружает список чатов при
+// открытии страницы. Реальная форма трафика — проходит анти-бот (проверено
+// живьём) и ничего не создаёт: ни чатов, ни расхода квоты.
+// create_chat — POST /api/v2/chats/new: тоже проходит WAF, но создаёт пустой
+// чат «freeqwen-ping» на каждую проверку (запасная форма, если list_chats
+// вдруг заблокируют).
+// completions — legacy: прямой POST в /chat/completions без chat_id. Против
+// текущего WAF виснет/возвращает HTML-капчу; только для отладки/отката.
+// Любое другое значение нормализуется в list_chats.
+export const QWEN_PING_MODE = ['list_chats', 'create_chat', 'completions'].includes(process.env.QWEN_PING_MODE)
+    ? process.env.QWEN_PING_MODE
+    : 'list_chats';
 
 // ─── Таймауты (мс) ──────────────────────────────────────────────────────────
 export const PAGE_TIMEOUT = Number(process.env.PAGE_TIMEOUT) || 120_000;
@@ -89,6 +108,31 @@ export const MAX_RETRY_COUNT = Number(process.env.MAX_RETRY_COUNT) || 3;
 export const RATE_LIMIT_DEFAULT_HOURS = Number(process.env.RATE_LIMIT_DEFAULT_HOURS) || 1;
 export const TASK_POLL_MAX_ATTEMPTS = Number(process.env.TASK_POLL_MAX_ATTEMPTS) || 90;
 export const TASK_POLL_INTERVAL = Number(process.env.TASK_POLL_INTERVAL) || 2_000;
+
+// ─── Бан-висение Qwen (замерено стресс-тестами) ─────────────────────────────
+// Qwen НЕ возвращает 429: после ~25-35 операций (создание чата + сообщения)
+// на аккаунт в скользящем окне он начинает ДЕРЖАТЬ запросы без ответа
+// (разбан ~30-45 мин, когда окно сдвигается). Прокси не видит этот бан по
+// ответу, поэтому:
+//  1) проактивно лимитируем операции на аккаунт (QWEN_OPS_PER_HOUR) — паркуем
+//     аккаунт заранее, не давая дойти до бана;
+//  2) реактивно паркуем аккаунт, если create-chat/запрос не ответил за
+//     QWEN_BAN_DETECT_MS (нормальный create-chat — <1с, так что долгий ответ
+//     почти наверняка бан-висение) — вместо 300-секундного зависания ротация
+//     переключается на другой аккаунт и запрос падает быстро с 429.
+export const QWEN_OPS_PER_HOUR = Number(process.env.QWEN_OPS_PER_HOUR) || 25;
+export const QWEN_OPS_WINDOW_MS = Number(process.env.QWEN_OPS_WINDOW_MS) || 3600_000;
+export const QWEN_OPS_BAN_HOURS = Number(process.env.QWEN_OPS_BAN_HOURS) || 1;
+export const QWEN_BAN_DETECT_MS = Number(process.env.QWEN_BAN_DETECT_MS) || 20_000;
+// Ретрай после солва висит почти наверняка из-за ре-челленджа WAF. Ждать его
+// полные QWEN_BAN_DETECT_MS = 20с слишком долго для интерактивных клиентов:
+// recovery (проба WAF + повторный солв) запускается раньше, сам запрос при
+// этом не прерывается — успеет ответить — лишний солв просто пропадёт.
+export const QWEN_WAF_RECOVERY_MS = Number(process.env.QWEN_WAF_RECOVERY_MS) || 12_000;
+// Пауза между проверками аккаунтов в scripts/probe_accounts.js (cool-down).
+// Массовая проверка с одного IP быстрее провоцирует WAF-челлендж; разводка
+// по времени снижает число PUNISH из-за самого прогона.
+export const QWEN_PROBE_DELAY_MS = nonNegativeNumber(process.env.QWEN_PROBE_DELAY_MS, 2_000);
 
 // ─── Пути (относительно корня проекта) ───────────────────────────────────────
 export const SESSION_DIR = process.env.SESSION_DIR || 'session';

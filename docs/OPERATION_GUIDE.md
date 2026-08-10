@@ -182,12 +182,39 @@ Notes:
 
 ### Free chat (chat.qwen.ai) — what the proxy uses
 
-- No official numbers. In practice — **~100 messages/day per account** (soft
-  limit; smaller models are nearly unlimited, top models hit it faster).
-- On overflow or suspicious activity — anti-bot WAF/captcha:
-  `FAIL_SYS_USER_VALIDATE`, "被挤爆啦,请稍后重试". This is **not** a chat limit
-  but automation protection; fresh cookies/captcha clear it.
-- 14 accounts ≈ ~1400 messages/day headroom via rotation.
+- No official numbers. Measured under stress (Aug 2026): the binding limit is a
+  **sliding window of ~25-35 chat API operations (create-chat + messages) per
+  account per ~1 hour**. When exceeded, Qwen does **not** return 429 — it
+  silently **holds the request** (no response) until the window slides
+  (~30-45 min). Read-only calls (chat list) are not counted and keep working.
+- The proxy mitigates this two ways (see `QWEN_OPS_PER_HOUR`,
+  `QWEN_OPS_WINDOW_MS`, `QWEN_OPS_BAN_HOURS`, `QWEN_BAN_DETECT_MS` in
+  `.env.example`):
+  1) **proactively** parks an account after `QWEN_OPS_PER_HOUR` operations/hour;
+  2) **reactively** parks an account whose create-chat doesn't answer within
+     `QWEN_BAN_DETECT_MS` (normal create-chat is <1s, so a long one is almost
+     certainly a ban-hang) — rotation switches away instead of hanging
+     120-300s.
+- Anti-bot WAF/captcha (`FAIL_SYS_USER_VALIDATE`, "被挤爆啦,请稍后重试", and
+  the **x5sec slider challenge** — when the account crosses the ops threshold
+  Qwen answers completion with an HTML page that redirects to
+  `_____tmd_____/punish?...` with a simple "slide to verify" captcha). The
+  proxy now **solves the x5sec slider automatically** (`src/browser/x5secSolver.js`):
+  when the Node fetch sees the challenge body it extracts the punish URL,
+  drags the slider with a human-like trajectory in the logged-in browser, then
+  retries the same request on the same account (browser fetch, so the session
+  cookies apply). Live-measured: slider solved in ~1.7-2.2s, first attempt;
+  each challenged request keeps succeeding instead of hanging 120-300s or
+  parking the account for 30-45 min. If solving fails, the account is parked
+  and rotation moves on as before.
+  - A retry after a solve can hang again when the WAF re-challenges the
+    session: the proxy then probes the challenge (Node fetch) and solves the
+    slider again on a dedicated tab (not from the page pool, which is busy
+    serving requests), instead of parking the account. Bounded by
+    `MAX_RETRY_COUNT`; solving uses a dedicated browser tab so it never
+    starves under concurrency.
+- With 14 accounts and even rotation, the proxy sustains roughly
+  `accounts × QWEN_OPS_PER_HOUR` chat operations per hour (~350) without bans.
 
 ### Paid API (Model Studio / DashScope) — for an official key
 
@@ -204,8 +231,13 @@ Notes:
 
 ### "Qwen returned an anti-bot page (WAF)" / FAIL_SYS_USER_VALIDATE
 
-Requests are sent without session cookies (cookies deleted or not loaded).
-Check:
+This is the x5sec slider challenge; the proxy auto-solves it (see the section
+on limits above). If you see it in the logs (`x5sec: слайдер решён`), the
+auto-solve worked. If accounts end up parked anyway, the ops window is hot:
+slow down (`QWEN_OPS_PER_HOUR`) or add more accounts.
+
+If requests are sent without session cookies (cookies deleted or not loaded):
+check:
 
 ```bash
 ls session/accounts/*/cookies.json   # at least one file should exist
@@ -241,6 +273,34 @@ headless mode. Check `logs/combined.log`.
 
 Make sure Chromium/Chrome is installed. You can point to it explicitly:
 `CHROME_PATH=/usr/bin/chromium npm start`.
+
+### Every account gets WAF challenges / "same cookies every time"
+
+Check that each account in `session/tokens.json` has **its own** cookie session:
+
+```bash
+ls session/accounts/*/cookies.json | wc -l   # should be >= number of tokens
+```
+
+A historical auth bug saved cookies under a *different* `acc_<id>` than the
+one in `tokens.json`, so all tokens ended up sharing a handful of mixed
+sessions (WAF sees token A + cookies of account B and challenges/hangs
+everything). Repair it once, non-destructively (pairs orphan cookie dirs to
+their token by creation order):
+
+```bash
+node scripts/repair_account_cookies.js
+```
+
+Since this fix, `npm run auth -- --add` / `--relogin` save the cookies under
+the same id as the token, and every managed account runs in its own isolated
+browser context (`getAccountBrowserContext`), so sessions no longer mix. If
+accounts were added before the fix, run the repair script once after updating.
+
+Note: WAF challenge windows are time-based and oscillate. If `probe_accounts.js
+--browser` shows hangs while raw fetch works (or vice versa), that is the WAF
+toggling challenge mode on the source IP — slow down (`QWEN_OPS_PER_HOUR`,
+`QWEN_PROBE_DELAY_MS`), let the auto-solve work, or rotate the IP.
 
 ---
 

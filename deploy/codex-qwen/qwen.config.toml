@@ -1,0 +1,13 @@
+model = "qwen3.8-max"
+model_provider = "codex_local_access"
+model_context_window = 131072
+model_auto_compact_token_limit = 98304
+model_catalog_json = "~/.codex/qwen-models.json"
+[model_providers.codex_local_access]
+name = "FreeQwenApi"
+base_url = "http://127.0.0.1:3270/v1"
+wire_api = "responses"
+experimental_bearer_token = "local-ssh-tunnel"
+request_max_retries = 2
+stream_max_retries = 2
+stream_idle_timeout_ms = 300000

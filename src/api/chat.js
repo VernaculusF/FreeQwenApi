@@ -1,16 +1,19 @@
-import { getBrowserContext, getPageFromContext, getAuthenticationStatus, setAuthenticationStatus, isBrowserVisibleMode } from '../browser/browser.js';
+import { getBrowserContext, getAccountBrowserContext, getPageFromContext, getAuthenticationStatus, setAuthenticationStatus, isBrowserVisibleMode } from '../browser/browser.js';
 import { checkAuthentication, checkVerification } from '../browser/auth.js';
 import { shutdownBrowser, initBrowser } from '../browser/browser.js';
 import { withOperationGuard } from '../utils/operationGuard.js';
 import { buildQwenRequestHeaders, classifyQwenError } from './qwenPing.js';
 import { isAntiBotBody } from '../utils/verificationMarkers.js';
-import { saveAuthToken } from '../browser/session.js';
+import { extractPunishUrl, solveX5secChallenge } from '../browser/x5secSolver.js';
+import { saveAuthToken, saveSession } from '../browser/session.js';
 import {
     getAvailableToken,
     getAvailableTokenById,
     hasValidTokens,
     markInvalidByToken,
-    markRateLimitedByToken
+    markRateLimitedByToken,
+    recordOp,
+    isOpsOverLimit
 } from './tokenManager.js';
 import {
     createAccountAffinityRegistry,
@@ -27,7 +30,8 @@ import {
     PAGE_TIMEOUT, RETRY_DELAY, PAGE_POOL_SIZE,
     DEFAULT_MODEL, MAX_RETRY_COUNT, RATE_LIMIT_DEFAULT_HOURS,
     TASK_POLL_MAX_ATTEMPTS, TASK_POLL_INTERVAL,
-    NON_INTERACTIVE, PAGE_EVALUATE_TIMEOUT, POOL_PROBE_TIMEOUT
+    NON_INTERACTIVE, PAGE_EVALUATE_TIMEOUT, POOL_PROBE_TIMEOUT,
+    QWEN_OPS_PER_HOUR, QWEN_OPS_WINDOW_MS, QWEN_OPS_BAN_HOURS, QWEN_BAN_DETECT_MS, QWEN_WAF_RECOVERY_MS
 } from '../config.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -152,14 +156,42 @@ export function buildQwenCompletionUrl(apiUrl, chatId) {
 // возвращать их в пул, даже если page.close() ещё выполняется.
 const disposedPages = new WeakSet();
 
+// Контекст, из которого создана страница (для изоляции аккаунтов: страницу
+// одного аккаунта нельзя отдавать другому — у них разные cookies).
+const pageContextMap = new WeakMap();
+
+// Идентичность cookie-контекста запрошенного объекта: для Puppeteer Page — её
+// BrowserContext, для BrowserContext — сам объект, для моков/тестов — как есть.
+export function contextIdentity(context) {
+    try {
+        if (context && typeof context.browserContext === 'function') return context.browserContext();
+    } catch { /* не Puppeteer */ }
+    return context;
+}
+
+// Контекст браузера для запросов конкретного managed-аккаунта. У аккаунтов из
+// tokens.json (id вида managed:acc_...) свои cookies — используем изолированный
+// контекст, чтобы WAF видел консистентную сессию, а не «токен A + cookies B».
+export async function resolveRequestBrowserContext(accountId) {
+    const storedId = getStoredManagedAccountId(accountId);
+    if (!storedId) return getBrowserContext();
+    return (await getAccountBrowserContext(storedId)) || getBrowserContext();
+}
+
 export const pagePool = {
     pages: [],
     maxSize: PAGE_POOL_SIZE,
 
     async getPage(context) {
         const baseContext = getBrowserContext();
-        while (this.pages.length > 0) {
+        const wantCtx = contextIdentity(context);
+        // Ограничиваем число просмотров пула: страницы чужих контекстов
+        // возвращаем обратно (они нужны своему аккаунту), а не выбрасываем.
+        const poolSize = this.pages.length;
+        let scanned = 0;
+        while (this.pages.length > 0 && scanned < poolSize) {
             const page = this.pages.pop();
+            scanned++;
             try {
                 if (page === baseContext) {
                     logWarn('Базовая страница не должна быть в пуле, пропускаем');
@@ -171,6 +203,12 @@ export const pagePool = {
                 }
                 if (page.isClosed()) {
                     logWarn('Страница из пула закрыта, пропускаем');
+                    continue;
+                }
+                const pageCtx = pageContextMap.get(page);
+                if (wantCtx && pageCtx && pageCtx !== wantCtx) {
+                    // Страница другого аккаунта (другие cookies) — оставляем в пуле.
+                    this.pages.push(page);
                     continue;
                 }
                 await withOperationGuard(
@@ -187,6 +225,7 @@ export const pagePool = {
         }
 
         const newPage = await getPageFromContext(context);
+        pageContextMap.set(newPage, contextIdentity(newPage) || wantCtx || context);
         await newPage.goto(CHAT_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT });
 
         if (!browserAuthToken) {
@@ -887,7 +926,9 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
 
 export function shouldReturnNodeStreamingResponse(streamedResponse, preferNodeFetch = false) {
     if (streamedResponse?.hasStreamedChunks === true) return true;
-    if (streamedResponse?.antiBot) return Boolean(preferNodeFetch);
+    // anti-bot челлендж (x5sec): не падаем в browser fetch (там он виснет),
+    // а отдаём в handleApiError → автоматическое решение слайдера + повтор.
+    if (streamedResponse?.antiBot) return true;
     return Boolean(
         streamedResponse?.success ||
         streamedResponse?.status ||
@@ -895,12 +936,16 @@ export function shouldReturnNodeStreamingResponse(streamedResponse, preferNodeFe
     );
 }
 
-async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, credentials = 'omit', signal = null) {
+async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, credentials = 'omit', signal = null, options = {}) {
     if (signal?.aborted) {
         return { success: false, error: 'Запрос отменён клиентом', aborted: true };
     }
-    const preferNodeFetch = String(process.env.QWEN_USE_NODE_FETCH || '').toLowerCase() === '1' || String(process.env.QWEN_USE_NODE_FETCH || '').toLowerCase() === 'true';
-    if (payload?.stream !== false && (typeof onChunk === 'function' || preferNodeFetch)) {
+    // forceBrowserFetch: после решения x5sec-челленджа повторяем запрос через
+    // браузер (cookies сессии), а не Node fetch — разблокировка привязана к сессии.
+    const preferNodeFetch = options.forceBrowserFetch
+        ? false
+        : (String(process.env.QWEN_USE_NODE_FETCH || '').toLowerCase() === '1' || String(process.env.QWEN_USE_NODE_FETCH || '').toLowerCase() === 'true');
+    if (!options.forceBrowserFetch && payload?.stream !== false && (typeof onChunk === 'function' || preferNodeFetch)) {
         const streamedResponse = await executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChunk, signal);
 
         if (signal?.aborted) {
@@ -1073,7 +1118,8 @@ export function buildAccountSwitchRetryArgs(requestContext = {}) {
         onChunk = null,
         resetMessage = null,
         clientScope = null,
-        signal = null
+        signal = null,
+        forceBrowserFetch = false
     } = requestContext;
 
     return [
@@ -1092,7 +1138,8 @@ export function buildAccountSwitchRetryArgs(requestContext = {}) {
         onChunk,
         resetMessage,
         clientScope,
-        signal
+        signal,
+        forceBrowserFetch
     ];
 }
 
@@ -1101,6 +1148,145 @@ export async function retryAfterAccountSwitch(requestContext, sendMessageFn) {
         throw new TypeError('sendMessageFn must be a function');
     }
     return sendMessageFn(...buildAccountSwitchRetryArgs(requestContext));
+}
+
+/**
+ * Повтор после решения x5sec-челленджа: тот же аккаунт, тот же чат,
+ * форсируем браузерный fetch (разблокировка привязана к cookies сессии).
+ */
+export async function retryAfterChallengeSolve(requestContext, sendMessageFn) {
+    if (typeof sendMessageFn !== 'function') {
+        throw new TypeError('sendMessageFn must be a function');
+    }
+    const args = buildAccountSwitchRetryArgs({ ...requestContext, forceBrowserFetch: true });
+    // сохраняем chatId/parentId — не жжём create-chat операцию на повтор
+    args[2] = requestContext.chatId ?? null;
+    args[3] = requestContext.parentId ?? null;
+    return sendMessageFn(...args);
+}
+
+/**
+ * Похоже ли на зависший ретрай после солва (WAF пере-челленджил сессию,
+ * браузерный fetch упал с сетевой ошибкой без тела)? Если да — лечим
+ * пробой + повторным решением, а не парковкой.
+ */
+export function isWafRetryHang(response = {}, requestContext = {}) {
+    if (!requestContext.forceBrowserFetch) return false;
+    if (requestContext.retryCount >= MAX_RETRY_COUNT) return false;
+    if (response.aborted || response.status || response.antiBot) return false;
+    // «Unexpected non-SSE 200 response» на ретрае после солва — вариант
+    // WAF-троттла/челленджа (тело не-SSE, не распознанное как antiBot):
+    // пробуем восстановиться пробой + повторным солвом.
+    if (response.error === 'Unexpected non-SSE 200 response') return true;
+    if (response.errorBody) return false;
+    return /network|fetch|timeout|таймаут|abort/i.test(response.error || '');
+}
+
+/**
+ * Решение слайдера на ОТДЕЛЬНОЙ вкладке (не из пула): пул занят рабочими
+ * запросами, и под конкуренцией солвер из пула голодает → ложная парковка.
+ * Вкладку создаём и закрываем сами. В видимом режиме (ручная авторизация)
+ * не создаём вкладки под капотом — авто-солв пропускаем.
+ */
+async function solveWafChallenge(browserContext, punishUrl, accountId = null) {
+    if (isBrowserVisibleMode()) {
+        logWarn('x5sec: видимый режим — не создаём вкладку для решения, авто-солв пропущен');
+        return false;
+    }
+    let solvePage = null;
+    try {
+        solvePage = await getPageFromContext(browserContext);
+        const solved = await solveX5secChallenge(solvePage, punishUrl);
+        if (solved && accountId) {
+            // После солва WAF выдаёт свежие cookies (x5sec/nc_sig), которыми
+            // разблокируется сессия. Сохраняем их в сессию аккаунта, чтобы
+            // разблокировка пережила рестарт и не терялась в общей куче.
+            try {
+                const saved = await saveSession(solvePage, accountId);
+                if (saved) logInfo(`x5sec: cookies аккаунта ${accountId} обновлены после солва`);
+            } catch (e) {
+                logWarn(`x5sec: не удалось сохранить cookies после солва: ${e.message?.slice(0, 80)}`);
+            }
+        }
+        return solved;
+    } catch (e) {
+        logWarn(`x5sec: ошибка решения на отдельной вкладке: ${e.message?.slice(0, 100)}`);
+        return false;
+    } finally {
+        if (solvePage) await solvePage.close().catch(() => {});
+    }
+}
+
+/**
+ * Проба WAF-состояния аккаунта: свежий чат + completion через Node fetch.
+ * Если аккаунт в x5sec-челлендже — вернёт punish HTML быстро (create-chat
+ * не челленджится), и мы достаём URL капчи. Если аккаунт здоров — сгенерит
+ * реальный ответ (kind: 'ok'). Свежий чат, чтобы не трогать тред реального.
+ */
+async function probeWafChallenge(tokenObj, model) {
+    try {
+        const createRes = await fetch(CREATE_CHAT_URL, {
+            method: 'POST',
+            headers: buildQwenRequestHeaders(tokenObj.token),
+            body: JSON.stringify({ title: 'waf-probe', models: [model], chat_mode: 'normal', chat_type: 't2t', timestamp: Date.now() }),
+            signal: AbortSignal.timeout(8000)
+        });
+        const createBody = await createRes.text();
+        const probeChatId = JSON.parse(createBody)?.data?.id;
+        if (!probeChatId) return { kind: 'failed' };
+
+        const probePayload = buildPayloadV2('ping', model, probeChatId, crypto.randomUUID());
+        const res = await executeApiRequestWithNodeStreaming(
+            `${CHAT_API_URL}?chat_id=${probeChatId}`,
+            probePayload,
+            tokenObj.token,
+            null,
+            AbortSignal.timeout(8000)
+        );
+        if (res?.antiBot) {
+            const punishUrl = extractPunishUrl(res.errorBody);
+            if (punishUrl) return { kind: 'challenge', punishUrl };
+            return { kind: 'failed' };
+        }
+        return res?.success ? { kind: 'ok' } : { kind: 'failed' };
+    } catch (e) {
+        logDebug(`x5sec: проба WAF упала: ${e.message?.slice(0, 80)}`);
+        return { kind: 'failed' };
+    }
+}
+
+/**
+ * Восстановление после зависшего ретрая: подтверждаем челлендж пробой,
+ * решаем слайдер повторно. kind: 'solved' | 'ok' | 'failed' | 'busy'.
+ * 'busy' — другое восстановление уже идёт (не дублируем солвы).
+ */
+let wafRecoveryInFlight = false;
+
+async function tryRecoverFromWafHang(tokenObj, requestContext) {
+    if (wafRecoveryInFlight) return { kind: 'busy' };
+    const { model, retryCount } = requestContext;
+    if (retryCount >= MAX_RETRY_COUNT || !tokenObj?.token) return { kind: 'failed' };
+
+    wafRecoveryInFlight = true;
+    try {
+        logInfo(`x5sec: ретрай завис — пробируем WAF-состояние аккаунта (${tokenObj.id})`);
+        const probe = await probeWafChallenge(tokenObj, model);
+        if (probe.kind !== 'challenge') {
+            logWarn(`x5sec: проба не показала челлендж (${probe.kind})`);
+            return probe;
+        }
+
+        logInfo('x5sec: WAF-челлендж подтверждён — решаем слайдер повторно');
+        const solved = await solveWafChallenge(requestContext.browserContext, probe.punishUrl, tokenObj?.id);
+        if (solved) {
+            logInfo('x5sec: повторное решение успешно');
+            return { kind: 'solved' };
+        }
+        logWarn('x5sec: повторное решение слайдера не удалось');
+        return { kind: 'failed' };
+    } finally {
+        wafRecoveryInFlight = false;
+    }
 }
 
 async function handleApiError(response, tokenObj, requestContext) {
@@ -1195,7 +1381,51 @@ async function handleApiError(response, tokenObj, requestContext) {
             logInfo('Пересоздаем чат под следующим доступным аккаунтом после rate limit');
             return retryAfterAccountSwitch(requestContext, sendMessage);
         }
-        return { error: `Все токены заблокированы по лимиту (${hours}ч)`, chatId };
+        return { error: `Все токены заблокированы по лимиту (${hours}ч)`, status: 429, chatId };
+    }
+
+    if (response.antiBot) {
+        // WAF/anti-bot челлендж (x5sec/_____tmd_____). Сначала пробуем решить
+        // слайдер автоматически (это примитивная капча «проведите вправо»),
+        // и только при неудаче паркуем аккаунт и переключаемся на другой.
+        const punishUrl = extractPunishUrl(response.errorBody);
+        if (punishUrl && retryCount < MAX_RETRY_COUNT) {
+            logInfo(`x5sec: anti-bot челлендж (${tokenObj?.id}) — пробуем решить слайдер автоматически`);
+            const solved = await solveWafChallenge(requestContext.browserContext, punishUrl, tokenObj?.id);
+            if (solved) {
+                logInfo('x5sec: слайдер решён — повторяем запрос на том же аккаунте');
+                return retryAfterChallengeSolve(requestContext, sendMessage);
+            }
+            logWarn(`x5sec: не удалось решить челлендж (${tokenObj?.id}) — паркуем аккаунт`);
+        } else if (!punishUrl) {
+            logDebug('x5sec: в anti-bot ответе не найден punish URL — сразу паркуем');
+        }
+        logWarn(`Qwen вернул anti-bot челлендж (${tokenObj?.id}) — паркуем аккаунт на ${QWEN_OPS_BAN_HOURS}ч и пробуем другой`);
+        markRateLimitedByToken(tokenObj?.token, QWEN_OPS_BAN_HOURS);
+        if (isBrowserAccountId(tokenObj?.id) || browserAuthToken === tokenObj?.token) {
+            markBrowserTokenRateLimited(tokenObj?.token, QWEN_OPS_BAN_HOURS);
+        }
+        chatAccountAffinity.forget(chatId);
+        if (retryCount < MAX_RETRY_COUNT && await canRetryWithAnotherAccount(tokenObj, requestContext.browserContext)) {
+            logInfo('Пересоздаем чат под другим аккаунтом после anti-bot челленджа');
+            return retryAfterAccountSwitch(requestContext, sendMessage);
+        }
+        return { error: 'Qwen вернул anti-bot челлендж; все аккаунты припаркованы', status: 403, chatId };
+    }
+
+    // Ретрай после солва может снова зависнуть: WAF пере-челленджит сессию,
+    // браузерный fetch виснет и падает с сетевой ошибкой без тела. Это не
+    // «мёртвый» аккаунт — пробируем челлендж и решаем его повторно, вместо
+    // парковки. Ограничено MAX_RETRY_COUNT, как и остальные ретраи.
+    if (isWafRetryHang(response, requestContext)) {
+        logWarn(`x5sec: ретрай после солва завис/упал (${tokenObj?.id}): ${response.error?.slice(0, 80)} — пробуем восстановиться`);
+        const recovery = await tryRecoverFromWafHang(tokenObj, requestContext);
+        if (recovery.kind === 'solved' || recovery.kind === 'ok') {
+            logInfo('x5sec: восстановление успешно — повторяем запрос на том же аккаунте');
+            return retryAfterChallengeSolve(requestContext, sendMessage);
+        }
+        logWarn(`x5sec: восстановление не удалось (${recovery.kind}) — отдаём ошибку`);
+        return { error: response.error || 'Сетевая ошибка после решения челленджа', chatId };
     }
 
     return { error: response.error || response.statusText, details: response.errorBody || 'Нет дополнительных деталей', chatId };
@@ -1203,7 +1433,7 @@ async function handleApiError(response, tokenObj, requestContext) {
 
 // ─── Main public API ─────────────────────────────────────────────────────────
 
-export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null, parentId = null, files = null, tools = null, toolChoice = null, systemMessage = null, chatType = 't2t', size = null, waitForCompletion = true, retryCount = 0, onChunk = null, resetMessage = null, clientScope = null, signal = null) {
+export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null, parentId = null, files = null, tools = null, toolChoice = null, systemMessage = null, chatType = 't2t', size = null, waitForCompletion = true, retryCount = 0, onChunk = null, resetMessage = null, clientScope = null, signal = null, forceBrowserFetch = false) {
     if (!availableModels) availableModels = getAvailableModelsFromFile();
 
     const validated = validateAndPrepareMessage(message);
@@ -1303,8 +1533,24 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
         fileAccountId: fileAffinity.accountId,
         browserContext,
         clientScope,
-        signal
+        signal,
+        forceBrowserFetch
     };
+    // Запросы и солв челленджа идут в контексте выбранного аккаунта: у каждого
+    // свои cookies, и WAF видит консистентную сессию вместо перемешанной.
+    retryContext.browserContext = (await resolveRequestBrowserContext(accountContext.accountId)) || browserContext;
+
+    // Проактивная защита от бан-висения для переиспользуемых чатов
+    // (для новых чатов проверка уже есть внутри createChatV2).
+    if (isOpsOverLimit(tokenObj.token, QWEN_OPS_PER_HOUR, QWEN_OPS_WINDOW_MS)) {
+        logWarn(`Аккаунт ${tokenObj.id}: превышен лимит операций Qwen (${QWEN_OPS_PER_HOUR}/час) — паркуем и пробуем другой`);
+        markRateLimitedByToken(tokenObj.token, QWEN_OPS_BAN_HOURS);
+        return handleApiError(
+            { status: 429, errorBody: JSON.stringify({ code: 'RateLimited', message: 'Лимит операций аккаунта' }) },
+            tokenObj,
+            retryContext
+        );
+    }
 
     if (!chatId) {
         const newChatResult = await createChatV2(model, 'Новый чат', 0, chatType, tokenObj);
@@ -1320,8 +1566,9 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
     }
 
     let page = null;
+    let completionBanTimer = null;
     try {
-        page = await pagePool.getPage(browserContext);
+        page = await pagePool.getPage(retryContext.browserContext);
 
         const verificationNeeded = await checkVerification(page);
         if (verificationNeeded) {
@@ -1343,6 +1590,39 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
         logDebug(`Отправка сообщения в чат ${chatId} с parent_id: ${parentId || 'null'}`);
 
         const apiUrl = `${CHAT_API_URL}?chat_id=${chatId}`;
+
+        // Реактивная страховка от бан-висения: WAF-челлендж x5sec может
+        // «зависнуть» в браузере, не отдав тело ответа. Если Qwen не ответил
+        // за QWEN_BAN_DETECT_MS — паркуем аккаунт. Запрос НЕ прерываем:
+        // длинная генерация может идти дольше; парковка лишь убирает аккаунт
+        // из ротации для последующих запросов.
+        // Ретрай после солва висит почти наверняка из-за ре-челленджа WAF:
+        // вместо парковки на час в фоне пробируем и решаем слайдер — сессия
+        // разблокируется, и висящий fetch может завершиться сам. Для обычного
+        // запроса (не ретрая) висящий completion — это бан-висение, паркуем.
+        if (QWEN_BAN_DETECT_MS > 0) {
+            // Для ретрая после солва recovery запускаем раньше (12с по умолчанию),
+            // чем бан-парковку обычного запроса (20с): запрос не прерывается,
+            // а фоновая разблокировка ускоряет висящий ретрай.
+            const hangDetectMs = forceBrowserFetch
+                ? Math.min(QWEN_BAN_DETECT_MS, QWEN_WAF_RECOVERY_MS)
+                : QWEN_BAN_DETECT_MS;
+            completionBanTimer = setTimeout(() => {
+                if (forceBrowserFetch) {
+                    logWarn(`Ретрай после солва не отвечает ${hangDetectMs}мс (${tokenObj.id}) — в фоне решаем WAF-челлендж`);
+                    tryRecoverFromWafHang(tokenObj, retryContext)
+                        .then((r) => logInfo(`x5sec: фоновая разблокировка: ${r.kind}`))
+                        .catch(() => {});
+                } else {
+                    logWarn(`Completion не отвечает ${QWEN_BAN_DETECT_MS}мс (${tokenObj.id}) — похоже на WAF-челлендж/бан-висение, паркуем аккаунт на ${QWEN_OPS_BAN_HOURS}ч`);
+                    markRateLimitedByToken(tokenObj.token, QWEN_OPS_BAN_HOURS);
+                    if (isBrowserAccountId(tokenObj.id) || browserAuthToken === tokenObj.token) {
+                        markBrowserTokenRateLimited(tokenObj.token, QWEN_OPS_BAN_HOURS);
+                    }
+                }
+            }, hangDetectMs);
+        }
+
         const response = await executeApiRequest(
             page,
             apiUrl,
@@ -1350,10 +1630,13 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
             tokenObj.token,
             onChunk,
             getBrowserFetchCredentials(tokenObj.id),
-            signal
+            signal,
+            { forceBrowserFetch: retryContext.forceBrowserFetch }
         );
+        if (completionBanTimer) clearTimeout(completionBanTimer);
 
         if (response.success && response.isTask) {
+            recordOp(tokenObj.token); // сообщение — операция в квоте Qwen
             logInfo('Обнаружен ответ с задачей (видеогенерация)');
             logRaw(JSON.stringify(response.data));
 
@@ -1429,6 +1712,7 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
         page = null;
 
         if (response.success) {
+            recordOp(tokenObj.token); // сообщение — операция в квоте Qwen
             logRaw(JSON.stringify(response.data));
             logInfo('Ответ получен успешно');
             bindResourceToAccount('chat', chatId, tokenObj.id);
@@ -1447,8 +1731,32 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
         return handleApiError(response, tokenObj, retryContext);
     } catch (error) {
         logError('Ошибка при отправке сообщения', error);
+        // Реактивная страховка: если completion не ответил до конца гарда
+        // (ETIMEDOUT) — Qwen держит запрос (бан-висение). Паркуем аккаунт,
+        // чтобы следующие запросы шли на другие аккаунты. Для ретрая после
+        // солва таймаут почти наверняка ре-челлендж — сначала восстанавливаемся.
+        if (error?.code === 'ETIMEDOUT' && tokenObj?.token) {
+            if (forceBrowserFetch && retryCount < MAX_RETRY_COUNT) {
+                const recovery = await tryRecoverFromWafHang(tokenObj, retryContext);
+                if (recovery.kind === 'solved' || recovery.kind === 'ok') {
+                    logInfo('x5sec: восстановление после таймаута ретрая — повторяем запрос');
+                    return retryAfterChallengeSolve(retryContext, sendMessage);
+                }
+                if (recovery.kind === 'busy') {
+                    // другое восстановление уже идёт — не паркуем, отдаём временную ошибку
+                    return { error: 'Запрос завис; WAF-разблокировка в процессе, повторите', chatId };
+                }
+                logWarn(`x5sec: восстановление не удалось (${recovery.kind}) — паркуем`);
+            }
+            logWarn(`Запрос к Qwen не ответил за таймаут (${tokenObj.id}) — похоже на бан-висение, паркуем аккаунт на ${QWEN_OPS_BAN_HOURS}ч`);
+            markRateLimitedByToken(tokenObj.token, QWEN_OPS_BAN_HOURS);
+            if (isBrowserAccountId(tokenObj.id) || browserAuthToken === tokenObj.token) {
+                markBrowserTokenRateLimited(tokenObj.token, QWEN_OPS_BAN_HOURS);
+            }
+        }
         return { error: error.toString(), chatId };
     } finally {
+        if (completionBanTimer) clearTimeout(completionBanTimer);
         if (page) {
             pagePool.releasePage(page);
         }
@@ -1520,10 +1828,11 @@ export async function pollQwenTaskStatus(taskId, waitForCompletion = false, clie
     if (!tokenObj?.token) {
         return { error: 'Аккаунт Qwen-задачи недоступен', status: 409, task_id: taskId };
     }
+    const requestBrowserContext = (await resolveRequestBrowserContext(tokenObj.id)) || browserContext;
 
     let page = null;
     try {
-        page = await pagePool.getPage(browserContext);
+        page = await pagePool.getPage(requestBrowserContext);
         const result = waitForCompletion
             ? await pollTaskStatus(
                 taskId,
@@ -1570,10 +1879,19 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый ч
     const tokenObj = preferredToken || await resolveAuthToken(browserContext);
     if (!tokenObj) return { error: 'Не удалось получить токен авторизации' };
     logInfo(`Используется аккаунт для создания чата: ${tokenObj.id}`);
+    const requestBrowserContext = (await resolveRequestBrowserContext(tokenObj.id)) || browserContext;
+
+    // Проактивная защита от бан-висения: не даём аккаунту превысить лимит
+    // операций Qwen в скользящем окне (замерено: ~25-35/час, бан без 429).
+    if (isOpsOverLimit(tokenObj.token, QWEN_OPS_PER_HOUR, QWEN_OPS_WINDOW_MS)) {
+        logWarn(`Аккаунт ${tokenObj.id}: превышен лимит операций Qwen (${QWEN_OPS_PER_HOUR}/час) — паркуем и пробуем другой`);
+        markRateLimitedByToken(tokenObj.token, QWEN_OPS_BAN_HOURS);
+        return { error: 'Аккаунт исчерпал лимит операций Qwen', status: 429, accountId: tokenObj.id };
+    }
 
     let page = null;
     try {
-        page = await pagePool.getPage(browserContext);
+        page = await pagePool.getPage(requestBrowserContext);
 
         const payload = { title, models: [model], chat_mode: 'normal', chat_type: chatType, timestamp: Date.now() };
         const requestBody = {
@@ -1599,7 +1917,10 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый ч
                 }
             }, requestBody),
             {
-                timeoutMs: PAGE_EVALUATE_TIMEOUT,
+                // create-chat в норме отвечает <1с; если он не ответил за
+                // QWEN_BAN_DETECT_MS — это почти наверняка бан-висение Qwen.
+                // Короткий гард + парковка по ETIMEDOUT в catch ниже.
+                timeoutMs: Math.min(PAGE_EVALUATE_TIMEOUT, QWEN_BAN_DETECT_MS),
                 label: 'Создание чата',
                 onAbort: () => pagePool.disposePage(page)
             }
@@ -1611,6 +1932,7 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый ч
         if (result.success && result.data?.success && result.data?.data?.id) {
             const createdChatId = result.data.data.id;
             bindResourceToAccount('chat', createdChatId, tokenObj.id);
+            recordOp(tokenObj.token); // создание чата — операция в квоте Qwen
             logInfo(`Чат создан: ${createdChatId}`);
             return {
                 success: true,
@@ -1667,7 +1989,17 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый ч
         };
     } catch (error) {
         logError('Ошибка при создании чата', error);
-        return { error: error.toString() };
+        // Qwen при бане просто держит запрос без ответа — гард истёк по
+        // таймауту (ETIMEDOUT). Паркуем аккаунт, чтобы ротация не упиралась
+        // в зависший аккаунт, а следующий запрос пошёл на другой.
+        if (error?.code === 'ETIMEDOUT' && tokenObj?.token) {
+            logWarn(`Создание чата не ответило за ${QWEN_BAN_DETECT_MS}мс (${tokenObj.id}) — похоже на бан-висение Qwen, паркуем аккаунт на ${QWEN_OPS_BAN_HOURS}ч`);
+            markRateLimitedByToken(tokenObj.token, QWEN_OPS_BAN_HOURS);
+            if (isBrowserAccountId(tokenObj.id) || browserAuthToken === tokenObj.token) {
+                markBrowserTokenRateLimited(tokenObj.token, QWEN_OPS_BAN_HOURS);
+            }
+        }
+        return { error: error.toString(), accountId: tokenObj?.id };
     } finally {
         if (page) {
             pagePool.releasePage(page);

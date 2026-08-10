@@ -1,6 +1,6 @@
 import { getBrowserContext } from '../browser/browser.js';
 import { logInfo, logError } from '../logger/index.js';
-import { bindResourceToAccount, getBrowserFetchCredentials, pagePool, selectRequestAccount } from './chat.js';
+import { bindResourceToAccount, getBrowserFetchCredentials, pagePool, resolveRequestBrowserContext, selectRequestAccount } from './chat.js';
 import fs from 'fs';
 import path from 'path';
 import { STS_TOKEN_API_URL, OSS_SDK_URL } from '../config.js';
@@ -37,10 +37,12 @@ export async function getStsToken(fileInfo, clientScope = null) {
     const browserContext = validateBrowserContext();
     const account = await validateAuthAccount(browserContext);
     logInfo(`Запрос STS токена для файла: ${fileInfo.filename}`);
+    // Загрузка файла привязана к аккаунту: используем его изолированный контекст.
+    const accountContext = (await resolveRequestBrowserContext(account.id)) || browserContext;
 
     let page = null;
     try {
-        page = await pagePool.getPage(browserContext);
+        page = await pagePool.getPage(accountContext);
         const result = await page.evaluate(async (data) => {
             try {
                 const response = await fetch(data.apiUrl, {

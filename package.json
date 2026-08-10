@@ -19,6 +19,7 @@
         "example:streaming-test": "node examples/streaming-test.js",
         "auth": "node scripts/auth.js",
         "workers": "node scripts/workers.js",
+        "codex:bridge": "node scripts/codex_responses_bridge.js",
         "models:sync": "node scripts/sync_models.js",
         "smoke": "node scripts/smoke_test.js"
     },

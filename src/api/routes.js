@@ -5,7 +5,7 @@ import { sendApiResultError } from './apiErrors.js';
 import { resolveAuthDecision } from './authPolicy.js';
 import { getAuthenticationStatus, getBrowserContext } from '../browser/browser.js';
 import { checkAuthentication } from '../browser/auth.js';
-import { logInfo, logError, logDebug } from '../logger/index.js';
+import { logInfo, logWarn, logError, logDebug } from '../logger/index.js';
 import { getMappedModel } from './modelMapping.js';
 import { getStsToken, uploadFileToQwen } from './fileUpload.js';
 import { loadHistory, saveHistory } from './chatHistory.js';
@@ -16,6 +16,7 @@ import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
 import { parseToolCallJson } from './toolParser.js';
+import { chatTranscriptStore, sequenceKeys } from './chatTranscript.js';
 import { listTokens, markInvalid, markRateLimited, markValid } from './tokenManager.js';
 import { FORGETMEAI_WATERMARK } from '../utils/branding.js';
 import {
@@ -556,7 +557,9 @@ function shouldFoldOpenAITranscript(messages, combinedTools, effectiveChatId) {
     // When tools are available, prefer the OpenAI transcript over Qwen's opaque web
     // chat memory on multi-message turns. This keeps Hermes skill/tool discipline in
     // the prompt visible to Qwen instead of depending on previous web-chat state.
-    if (Array.isArray(combinedTools) && combinedTools.length > 0 && nonSystemMessages.length > 1) return true;
+    // With a known chatId the Qwen chat already holds the conversation, so folding
+    // would duplicate it — only fold when we are starting fresh/stateless.
+    if (Array.isArray(combinedTools) && combinedTools.length > 0 && nonSystemMessages.length > 1 && !effectiveChatId) return true;
 
     return false;
 }
@@ -984,6 +987,43 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, includeUsage = f
 
 // ─── Helpers: streaming ──────────────────────────────────────────────────────
 
+/** Пустая обёртка tool-call ({'tool_calls': []} без текста)? Qwen иногда отвечает
+ *  ей вместо обычного текста — такой ответ нечем показать, нужен повтор без tools. */
+function isEmptyToolEnvelope(content) {
+    const text = String(content || '').trim();
+    if (!text) return false;
+    try {
+        const parsed = JSON.parse(text);
+        return Boolean(parsed && Array.isArray(parsed.tool_calls) && parsed.tool_calls.length === 0 &&
+            Object.keys(parsed).every(k => k === 'tool_calls'));
+    } catch {
+        return /^\s*\{\s*"tool_calls"\s*:\s*\[\s*\]\s*\}\s*$/.test(text);
+    }
+}
+
+/**
+ * Отправка plain-text ответа кусками (16 символов) с задержкой STREAMING_CHUNK_DELAY.
+ * Используется в fallback, когда Qwen вернул JSON/обычный ответ вместо SSE:
+ * без этого весь текст уходил бы одним мгновенным чанком (для OpenCode и др.).
+ */
+async function streamContentInChunks(res, writeSse, content, mappedModel, chunkSize = 16) {
+    const codePoints = Array.from(String(content || ''));
+    for (let i = 0; i < codePoints.length; i += chunkSize) {
+        writeSse({
+            id: 'chatcmpl-stream',
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model: mappedModel || DEFAULT_MODEL,
+            choices: [{
+                index: 0,
+                delta: { content: codePoints.slice(i, i + chunkSize).join('') },
+                finish_reason: null
+            }]
+        });
+        await new Promise(r => setTimeout(r, STREAMING_CHUNK_DELAY));
+    }
+}
+
 async function handleStreamingResponse(res, mappedModel, messageContent, chatId, parentId, combinedTools, toolChoice, systemMessage) {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
@@ -1130,18 +1170,14 @@ router.post('/chat', async (req, res) => {
                 // Setup streaming callback
                 let streamingCallback = null;
                 let hasStreamedChunks = false;
+                let streamedText = '';
+                let finalAssistantContent = ''; // ответ ассистента для транскрипта беседы
                 if (stream) {
                     streamingCallback = (chunk) => {
                         hasStreamedChunks = true;
-                        writeSse({
-                            id: 'chatcmpl-' + Date.now(),
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: mappedModel || DEFAULT_MODEL,
-                            choices: [
-                                { index: 0, delta: { content: chunk }, finish_reason: null }
-                            ]
-                        });
+                        // Qwen отдаёт весь ответ одним SSE-событием — накапливаем и
+                        // пере-чанкуем ниже, чтобы вывод шёл постепенно.
+                        streamedText += chunk;
                     };
                 }
 
@@ -1182,26 +1218,60 @@ router.post('/chat', async (req, res) => {
                         ]
                     });
                 } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
-                    // Qwen вернул JSON/обычный ответ вместо SSE - отправляем контент одним чанком
-                    const content = result.choices[0].message.content;
+                    // Qwen вернул JSON/обычный ответ вместо SSE — стримим контент
+                    // кусками с задержкой, чтобы ответ появлялся постепенно, а не
+                    // одним мгновенным чанком (важно для OpenCode, который шлёт tools).
+                    let content = String(result.choices[0].message.content || '');
+                    if (isEmptyToolEnvelope(content)) {
+                        // Qwen ответил пустой обёрткой {"tool_calls":[]} без текста —
+                        // повторяем запрос БЕЗ tools, чтобы получить обычный ответ.
+                        logWarn('Qwen вернул пустую обёртку tool_calls — повторяем запрос без tools');
+                        const retried = await sendMessage(
+                            messageContent,
+                            mappedModel,
+                            qwenChatId,
+                            effectiveParentId,
+                            files,
+                            null,
+                            null,
+                            systemMessage, // БЕЗ tool-адаптера, иначе Qwen снова вернёт обёртку
+                            't2t',
+                            null,
+                            true,
+                            0,
+                            null,
+                            preparedInput.resetMessageContent,
+                            getSessionKey(req),
+                            signal
+                        );
+                        if (retried.error) {
+                            writeSse({
+                                id: 'chatcmpl-stream',
+                                object: 'chat.completion.chunk',
+                                created: Math.floor(Date.now() / 1000),
+                                model: mappedModel || DEFAULT_MODEL,
+                                choices: [{ index: 0, delta: { content: `Ошибка: ${retried.error}` }, finish_reason: 'stop' }]
+                            });
+                            safeEndSse(res);
+                            return;
+                        }
+                        content = String(retried?.choices?.[0]?.message?.content || '');
+                        if (isEmptyToolEnvelope(content)) content = '';
+                    }
+                    finalAssistantContent = content;
                     logDebug(`JSON response content length: ${content.length}`);
-                    if (typeof streamingCallback === 'function') {
-                        streamingCallback(content);
-                    } else {
-                        writeSse({
-                            id: 'chatcmpl-stream',
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: mappedModel || DEFAULT_MODEL,
-                            choices: [
-                                { index: 0, delta: { content }, finish_reason: null }
-                            ]
-                        });
+                    if (content) {
+                        await streamContentInChunks(res, writeSse, content, mappedModel);
                     }
                 } else {
                     logDebug(`Result structure: ${JSON.stringify(Object.keys(result))}`);
                 }
-                // Чанки уже были отправлены через streamingCallback, не дублируем!
+                // Qwen отдаёт ответ одним SSE-событием: стримим накопленный текст
+                // кусками с задержкой, чтобы клиент видел прогрессивный вывод.
+                if (hasStreamedChunks && streamedText) {
+                    finalAssistantContent = streamedText;
+                    await streamContentInChunks(res, writeSse, streamedText, mappedModel);
+                }
 
                 // Финальный чанк
                 writeSse({
@@ -1442,6 +1512,7 @@ router.post('/chat/completions', async (req, res) => {
         // Используем переданный chatId ИЛИ восстанавливаем из сессии
         let effectiveChatId = scopeClientChatId(explicitChatId, req);
         let effectiveParentId = explicitParentId;
+        let historyDerived = false; // effectiveChatId получен из истории (не от клиента)
 
         if (forceNewChat && !explicitChatId && !isMeta) {
             effectiveChatId = `chat_${crypto.randomBytes(8).toString('hex')}`;
@@ -1463,24 +1534,47 @@ router.post('/chat/completions', async (req, res) => {
                     logInfo(`Using client conversation-id key: ${effectiveChatId}`);
                 }
             } else if (ALLOW_UNSCOPED_SESSION_CHAT_RESTORE) {
-                const savedSession = forceNewChat ? null : getSavedChatId(req);
-                if (savedSession?.chatId) {
-                    effectiveChatId = savedSession.chatId;
-                    if (!effectiveParentId && savedSession.parentId) {
-                        effectiveParentId = savedSession.parentId;
-                    }
-                    logInfo(`Restored chatId from session: ${effectiveChatId}`);
-                }
-
-                if (!effectiveChatId) {
-                    const generatedId = generateChatIdFromHistory(messages, req);
-                    if (generatedId) {
-                        effectiveChatId = generatedId;
-                        logInfo(`Created new chatId for session: ${effectiveChatId}`);
+                // История-детерминированный id в приоритете: он стабилен для одной
+                // беседы (по первому сообщению пользователя) и не смешивает разные
+                // беседы одного клиента (в отличие от сессии по IP+UA).
+                const generatedId = generateChatIdFromHistory(messages, req);
+                if (generatedId) {
+                    effectiveChatId = generatedId;
+                    historyDerived = true;
+                    logInfo(`Created chatId from conversation history: ${effectiveChatId}`);
+                } else {
+                    const savedSession = forceNewChat ? null : getSavedChatId(req);
+                    if (savedSession?.chatId) {
+                        effectiveChatId = savedSession.chatId;
+                        if (!effectiveParentId && savedSession.parentId) {
+                            effectiveParentId = savedSession.parentId;
+                        }
+                        logInfo(`Restored chatId from session: ${effectiveChatId}`);
                     }
                 }
             } else {
                 logDebug('chatId/conversation_id не переданы, unscoped session fallback отключён');
+            }
+        }
+
+        // Fork-логика для history-derived id: беседа переиспользуется ТОЛЬКО при
+        // непрерывности транскрипта (входящая история — прямое продолжение сохранённой).
+        // Иначе создаётся отдельная беседа (fork) — сессии с одинаковым первым
+        // сообщением не смешивают контекст друг друга.
+        let forkedTranscript = null;
+        if (historyDerived && effectiveChatId) {
+            const incomingKeys = sequenceKeys(messages);
+            const continuationId = chatTranscriptStore.findContinuation(effectiveChatId, incomingKeys);
+            if (continuationId) {
+                effectiveChatId = continuationId;
+                chatTranscriptStore.appendDiff(effectiveChatId, incomingKeys, messages);
+            } else {
+                effectiveChatId = chatTranscriptStore.fork(effectiveChatId, incomingKeys, messages);
+                logInfo(`Новая fork-беседа: ${effectiveChatId} (${incomingKeys.length} сообщений)`);
+            }
+            forkedTranscript = chatTranscriptStore.buildWindowedTranscript(effectiveChatId);
+            if (forkedTranscript) {
+                logDebug(`Контекст беседы ${effectiveChatId} свёрнут из транскрипта прокси (${forkedTranscript.length} симв.)`);
             }
         }
 
@@ -1520,6 +1614,12 @@ router.post('/chat/completions', async (req, res) => {
         }
         if (preparedInput.folded) {
             logInfo('OpenAI/Hermes transcript folded into user message for context/tool-result preservation');
+        }
+        // Для history-derived бесед подставляем оконный fold из собственного транскрипта
+        // (если клиент сам не свернул контекст): контекст переживает свап аккаунта
+        // независимо от payload клиента, а размер свёртки ограничен.
+        if (forkedTranscript && !preparedInput.folded) {
+            preparedInput.resetMessageContent = forkedTranscript;
         }
 
         if (isMeta) {
@@ -1568,19 +1668,16 @@ router.post('/chat/completions', async (req, res) => {
                 // Setup streaming callback if stream=true
                 let streamingCallback = null;
                 let hasStreamedChunks = false;
+                let streamedText = '';
+                let finalAssistantContent = ''; // ответ ассистента для транскрипта беседы
                 const captureToolCalls = Array.isArray(combinedTools) && combinedTools.length > 0;
                 if (stream && !captureToolCalls) {
                     streamingCallback = (chunk) => {
                         hasStreamedChunks = true;
-                        writeSse({
-                            id: 'chatcmpl-stream',
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: mappedModel || DEFAULT_MODEL,
-                            choices: [
-                                { index: 0, delta: { content: chunk }, finish_reason: null }
-                            ]
-                        });
+                        // Qwen отдаёт весь ответ одним SSE-событием — накапливаем и
+                        // пере-чанкуем ниже (streamContentInChunks), чтобы вывод шёл
+                        // постепенно, а не одним мгновенным куском.
+                        streamedText += chunk;
                     };
                 }
 
@@ -1634,26 +1731,60 @@ router.post('/chat/completions', async (req, res) => {
                         ]
                     });
                 } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
-                    // Qwen вернул JSON/обычный ответ вместо SSE - отправляем контент одним чанком
-                    const content = result.choices[0].message.content;
+                    // Qwen вернул JSON/обычный ответ вместо SSE — стримим контент
+                    // кусками с задержкой, чтобы ответ появлялся постепенно, а не
+                    // одним мгновенным чанком (важно для OpenCode, который шлёт tools).
+                    let content = String(result.choices[0].message.content || '');
+                    if (isEmptyToolEnvelope(content)) {
+                        // Qwen ответил пустой обёрткой {"tool_calls":[]} без текста —
+                        // повторяем запрос БЕЗ tools, чтобы получить обычный ответ.
+                        logWarn('Qwen вернул пустую обёртку tool_calls — повторяем запрос без tools');
+                        const retried = await sendMessage(
+                            messageContent,
+                            mappedModel,
+                            qwenChatId,
+                            effectiveParentId,
+                            files,
+                            null,
+                            null,
+                            systemMessage, // БЕЗ tool-адаптера, иначе Qwen снова вернёт обёртку
+                            't2t',
+                            null,
+                            true,
+                            0,
+                            null,
+                            preparedInput.resetMessageContent,
+                            getSessionKey(req),
+                            signal
+                        );
+                        if (retried.error) {
+                            writeSse({
+                                id: 'chatcmpl-stream',
+                                object: 'chat.completion.chunk',
+                                created: Math.floor(Date.now() / 1000),
+                                model: mappedModel || DEFAULT_MODEL,
+                                choices: [{ index: 0, delta: { content: `Ошибка: ${retried.error}` }, finish_reason: 'stop' }]
+                            });
+                            safeEndSse(res);
+                            return;
+                        }
+                        content = String(retried?.choices?.[0]?.message?.content || '');
+                        if (isEmptyToolEnvelope(content)) content = '';
+                    }
+                    finalAssistantContent = content;
                     logDebug(`JSON response content length: ${content.length}`);
-                    if (typeof streamingCallback === 'function') {
-                        streamingCallback(content);
-                    } else {
-                        writeSse({
-                            id: 'chatcmpl-stream',
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: mappedModel || DEFAULT_MODEL,
-                            choices: [
-                                { index: 0, delta: { content }, finish_reason: null }
-                            ]
-                        });
+                    if (content) {
+                        await streamContentInChunks(res, writeSse, content, mappedModel);
                     }
                 } else {
                     logDebug(`Result structure: ${JSON.stringify(Object.keys(result))}`);
                 }
-                // Чанки уже были отправлены через streamingCallback, не дублируем!
+                // Qwen отдаёт ответ одним SSE-событием: стримим накопленный текст
+                // кусками с задержкой, чтобы клиент видел прогрессивный вывод.
+                if (hasStreamedChunks && streamedText) {
+                    finalAssistantContent = streamedText;
+                    await streamContentInChunks(res, writeSse, streamedText, mappedModel);
+                }
 
                 const finalBase = {
                     id: 'chatcmpl-stream',
@@ -1668,6 +1799,9 @@ router.post('/chat/completions', async (req, res) => {
                     ]
                 });
                 if (wantsOpenAIStreamUsage(req.body)) writeOpenAIUsageSse(res, finalBase, result.usage);
+                if (historyDerived && effectiveChatId && finalAssistantContent) {
+                    chatTranscriptStore.appendAssistant(effectiveChatId, finalAssistantContent);
+                }
                 safeEndSse(res);
 
             } catch (error) {
@@ -1714,6 +1848,9 @@ router.post('/chat/completions', async (req, res) => {
 
             if (result.error) {
                 return sendApiResultError(res, result, { openAI: true });
+            }
+            if (historyDerived && effectiveChatId && result?.choices?.[0]?.message?.content) {
+                chatTranscriptStore.appendAssistant(effectiveChatId, result.choices[0].message.content);
             }
 
             const toolCalls = parseToolCallJson(result?.choices?.[0]?.message?.content);
@@ -1790,6 +1927,7 @@ router.post('/v1/chat/completions', async (req, res) => {
         // Используем переданный chatId ИЛИ восстанавливаем из сессии
         let effectiveChatId = scopeClientChatId(explicitChatId, req);
         let effectiveParentId = explicitParentId;
+        let historyDerived = false; // effectiveChatId получен из истории (не от клиента)
 
         if (forceNewChat && !explicitChatId && !isMeta) {
             effectiveChatId = `chat_${crypto.randomBytes(8).toString('hex')}`;
@@ -1811,24 +1949,47 @@ router.post('/v1/chat/completions', async (req, res) => {
                     logInfo(`Using client conversation-id key: ${effectiveChatId}`);
                 }
             } else if (ALLOW_UNSCOPED_SESSION_CHAT_RESTORE) {
-                const savedSession = forceNewChat ? null : getSavedChatId(req);
-                if (savedSession?.chatId) {
-                    effectiveChatId = savedSession.chatId;
-                    if (!effectiveParentId && savedSession.parentId) {
-                        effectiveParentId = savedSession.parentId;
-                    }
-                    logInfo(`Restored chatId from session: ${effectiveChatId}`);
-                }
-
-                if (!effectiveChatId) {
-                    const generatedId = generateChatIdFromHistory(messages, req);
-                    if (generatedId) {
-                        effectiveChatId = generatedId;
-                        logInfo(`Created new chatId for session: ${effectiveChatId}`);
+                // История-детерминированный id в приоритете: он стабилен для одной
+                // беседы (по первому сообщению пользователя) и не смешивает разные
+                // беседы одного клиента (в отличие от сессии по IP+UA).
+                const generatedId = generateChatIdFromHistory(messages, req);
+                if (generatedId) {
+                    effectiveChatId = generatedId;
+                    historyDerived = true;
+                    logInfo(`Created chatId from conversation history: ${effectiveChatId}`);
+                } else {
+                    const savedSession = forceNewChat ? null : getSavedChatId(req);
+                    if (savedSession?.chatId) {
+                        effectiveChatId = savedSession.chatId;
+                        if (!effectiveParentId && savedSession.parentId) {
+                            effectiveParentId = savedSession.parentId;
+                        }
+                        logInfo(`Restored chatId from session: ${effectiveChatId}`);
                     }
                 }
             } else {
                 logDebug('chatId/conversation_id не переданы, unscoped session fallback отключён');
+            }
+        }
+
+        // Fork-логика для history-derived id: беседа переиспользуется ТОЛЬКО при
+        // непрерывности транскрипта (входящая история — прямое продолжение сохранённой).
+        // Иначе создаётся отдельная беседа (fork) — сессии с одинаковым первым
+        // сообщением не смешивают контекст друг друга.
+        let forkedTranscript = null;
+        if (historyDerived && effectiveChatId) {
+            const incomingKeys = sequenceKeys(messages);
+            const continuationId = chatTranscriptStore.findContinuation(effectiveChatId, incomingKeys);
+            if (continuationId) {
+                effectiveChatId = continuationId;
+                chatTranscriptStore.appendDiff(effectiveChatId, incomingKeys, messages);
+            } else {
+                effectiveChatId = chatTranscriptStore.fork(effectiveChatId, incomingKeys, messages);
+                logInfo(`Новая fork-беседа: ${effectiveChatId} (${incomingKeys.length} сообщений)`);
+            }
+            forkedTranscript = chatTranscriptStore.buildWindowedTranscript(effectiveChatId);
+            if (forkedTranscript) {
+                logDebug(`Контекст беседы ${effectiveChatId} свёрнут из транскрипта прокси (${forkedTranscript.length} симв.)`);
             }
         }
 
@@ -1868,6 +2029,12 @@ router.post('/v1/chat/completions', async (req, res) => {
         }
         if (preparedInput.folded) {
             logInfo('OpenAI/Hermes transcript folded into user message for context/tool-result preservation');
+        }
+        // Для history-derived бесед подставляем оконный fold из собственного транскрипта
+        // (если клиент сам не свернул контекст): контекст переживает свап аккаунта
+        // независимо от payload клиента, а размер свёртки ограничен.
+        if (forkedTranscript && !preparedInput.folded) {
+            preparedInput.resetMessageContent = forkedTranscript;
         }
 
         if (isMeta) {
@@ -1918,20 +2085,16 @@ router.post('/v1/chat/completions', async (req, res) => {
                 // Setup streaming callback if stream=true
                 let streamingCallback = null;
                 let hasStreamedChunks = false;
+                let streamedText = '';
+                let finalAssistantContent = ''; // ответ ассистента для транскрипта беседы
                 const captureToolCalls = Array.isArray(combinedTools) && combinedTools.length > 0;
                 if (stream && !captureToolCalls) {
                     streamingCallback = (chunk) => {
                         hasStreamedChunks = true;
-                        // OpenWebUI не нуждается в role в чанках - только контент
-                        writeSse({
-                            id: 'chatcmpl-' + Date.now(),
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: mappedModel || DEFAULT_MODEL,
-                            choices: [
-                                { index: 0, delta: { content: chunk }, finish_reason: null }
-                            ]
-                        });
+                        // Qwen отдаёт весь ответ одним SSE-событием — накапливаем и
+                        // пере-чанкуем ниже (streamContentInChunks), чтобы вывод шёл
+                        // постепенно, а не одним мгновенным куском.
+                        streamedText += chunk;
                     };
                 }
                 
@@ -1985,26 +2148,60 @@ router.post('/v1/chat/completions', async (req, res) => {
                         ]
                     });
                 } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
-                    // Qwen вернул JSON/обычный ответ вместо SSE - отправляем контент одним чанком
-                    const content = result.choices[0].message.content;
+                    // Qwen вернул JSON/обычный ответ вместо SSE — стримим контент
+                    // кусками с задержкой, чтобы ответ появлялся постепенно, а не
+                    // одним мгновенным чанком (важно для OpenCode, который шлёт tools).
+                    let content = String(result.choices[0].message.content || '');
+                    if (isEmptyToolEnvelope(content)) {
+                        // Qwen ответил пустой обёрткой {"tool_calls":[]} без текста —
+                        // повторяем запрос БЕЗ tools, чтобы получить обычный ответ.
+                        logWarn('Qwen вернул пустую обёртку tool_calls — повторяем запрос без tools');
+                        const retried = await sendMessage(
+                            messageContent,
+                            mappedModel,
+                            qwenChatId,
+                            effectiveParentId,
+                            files,
+                            null,
+                            null,
+                            systemMessage, // БЕЗ tool-адаптера, иначе Qwen снова вернёт обёртку
+                            't2t',
+                            null,
+                            true,
+                            0,
+                            null,
+                            preparedInput.resetMessageContent,
+                            getSessionKey(req),
+                            signal
+                        );
+                        if (retried.error) {
+                            writeSse({
+                                id: 'chatcmpl-stream',
+                                object: 'chat.completion.chunk',
+                                created: Math.floor(Date.now() / 1000),
+                                model: mappedModel || DEFAULT_MODEL,
+                                choices: [{ index: 0, delta: { content: `Ошибка: ${retried.error}` }, finish_reason: 'stop' }]
+                            });
+                            safeEndSse(res);
+                            return;
+                        }
+                        content = String(retried?.choices?.[0]?.message?.content || '');
+                        if (isEmptyToolEnvelope(content)) content = '';
+                    }
+                    finalAssistantContent = content;
                     logDebug(`JSON response content length: ${content.length}`);
-                    if (typeof streamingCallback === 'function') {
-                        streamingCallback(content);
-                    } else {
-                        writeSse({
-                            id: 'chatcmpl-stream',
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: mappedModel || DEFAULT_MODEL,
-                            choices: [
-                                { index: 0, delta: { content }, finish_reason: null }
-                            ]
-                        });
+                    if (content) {
+                        await streamContentInChunks(res, writeSse, content, mappedModel);
                     }
                 } else {
                     logDebug(`Result structure: ${JSON.stringify(Object.keys(result))}`);
                 }
-                // Чанки уже были отправлены через streamingCallback, не дублируем!
+                // Qwen отдаёт ответ одним SSE-событием: стримим накопленный текст
+                // кусками с задержкой, чтобы клиент видел прогрессивный вывод.
+                if (hasStreamedChunks && streamedText) {
+                    finalAssistantContent = streamedText;
+                    await streamContentInChunks(res, writeSse, streamedText, mappedModel);
+                }
 
                 const finalBase = {
                     id: 'chatcmpl-stream',
@@ -2019,6 +2216,9 @@ router.post('/v1/chat/completions', async (req, res) => {
                     ]
                 });
                 if (wantsOpenAIStreamUsage(req.body)) writeOpenAIUsageSse(res, finalBase, result.usage);
+                if (historyDerived && effectiveChatId && finalAssistantContent) {
+                    chatTranscriptStore.appendAssistant(effectiveChatId, finalAssistantContent);
+                }
                 safeEndSse(res);
 
             } catch (error) {
@@ -2066,6 +2266,11 @@ router.post('/v1/chat/completions', async (req, res) => {
 
             if (result.error) {
                 return sendApiResultError(res, result, { openAI: true });
+            }
+            if (historyDerived && effectiveChatId) {
+                const replyText = result?.choices?.[0]?.message?.content
+                    || (result.response && result.response.text ? result.response.text : '');
+                if (replyText) chatTranscriptStore.appendAssistant(effectiveChatId, replyText);
             }
 
             // Извлекаем контент сообщения

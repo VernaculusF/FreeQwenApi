@@ -53,7 +53,7 @@ npm run smoke
 http://localhost:3264/api
 ```
 
-> 📖 **Полная инструкция по эксплуатации** — запуск, аккаунты, конфигурация,
+> **Полная инструкция по эксплуатации** — запуск, аккаунты, конфигурация,
 > несколько инстансов/воркеров, лимиты Qwen и устранение неполадок: смотрите
 > [docs/OPERATION_GUIDE.md](docs/OPERATION_GUIDE.md).
 
@@ -103,7 +103,7 @@ npm run auth -- --import tokens.txt
 
 Формат `tokens.txt` — по одному токену на строку (пустые строки и строки с `#` игнорируются), можно именовать аккаунты `имя=токен`, либо передать JSON-массив строк или `[{"token": "...", "id": "alice"}]`.
 
-Проверить токены сразу лёгким ping (без создания чатов):
+Проверить токены сразу лёгким ping (read-only запрос списка чатов — та же форма, что и у web-клиента Qwen при загрузке страницы; проходит анти-бот, ничего не создаёт и квоту сообщений не расходует):
 
 ```bash
 npm run auth -- --import tokens.txt --check
@@ -373,31 +373,63 @@ custom_providers:
 
 ### OpenCode
 
-Для одноразового smoke-теста не обязательно менять постоянный config OpenCode — можно передать provider через `OPENCODE_CONFIG_CONTENT`:
+OpenCode подключается как OpenAI-compatible provider. При запуске через `npm run workers -- --workers 2` доступны **два воркера** — по 7 аккаунтов на каждом:
+
+| Provider | Воркер | Base URL | Пропускная способность |
+|---|---|---|---|
+| `freeqwen-a` | 0 | `http://127.0.0.1:3264/api` | ~175 запросов/час |
+| `freeqwen-b` | 1 | `http://127.0.0.1:3265/api` | ~175 запросов/час |
+
+> **Только стриминг.** OpenCode всегда работает через AI SDK (`streamText`) — запросы уходят с `stream: true`. Это и есть надёжный путь прокси: Node fetch + авто-солв x5sec-челленджа. Non-streaming (`stream: false`) уходит в browser fetch и может виснуть на WAF, поэтому для OpenCode используйте именно стриминговый режим (он включён по умолчанию, ничего отключать не нужно).
+
+Для одноразового smoke-теста provider можно передать через `OPENCODE_CONFIG_CONTENT`:
 
 ```bash
 export OPENCODE_CONFIG_CONTENT='{
   "$schema":"https://opencode.ai/config.json",
   "provider": {
-    "freeqwen": {
+    "freeqwen-a": {
       "npm":"@ai-sdk/openai-compatible",
-      "name":"FreeQwenApi",
+      "name":"FreeQwen Worker 0 (:3264)",
       "options": {
         "baseURL":"http://127.0.0.1:3264/api",
-        "apiKey":"dummy-key"
+        "apiKey":"dummy-key",
+        "timeout":900000,
+        "chunkTimeout":180000
       },
       "models": {
-        "qwen3.7-max": {"name":"qwen3.7-max"}
+        "qwen3.8-max": {"name":"Qwen 3.8 Max"},
+        "qwen3.7-max": {"name":"Qwen 3.7 Max"},
+        "qwen3.7-plus": {"name":"Qwen 3.7 Plus"},
+        "qwen3-coder-plus": {"name":"Qwen 3 Coder Plus"}
+      }
+    },
+    "freeqwen-b": {
+      "npm":"@ai-sdk/openai-compatible",
+      "name":"FreeQwen Worker 1 (:3265)",
+      "options": {
+        "baseURL":"http://127.0.0.1:3265/api",
+        "apiKey":"dummy-key",
+        "timeout":900000,
+        "chunkTimeout":180000
+      },
+      "models": {
+        "qwen3.8-max": {"name":"Qwen 3.8 Max"},
+        "qwen3.7-max": {"name":"Qwen 3.7 Max"},
+        "qwen3.7-plus": {"name":"Qwen 3.7 Plus"},
+        "qwen3-coder-plus": {"name":"Qwen 3 Coder Plus"}
       }
     }
   }
 }'
 
 opencode run 'Create smoke.js, run it, and report output' \
-  --model freeqwen/qwen3.7-max \
+  --model freeqwen-a/qwen3.8-max \
   --agent build \
   --print-logs
 ```
+
+Для постоянного использования добавьте те же `provider` блоки в глобальный `~/.config/opencode/opencode.json(c)` (или в проектный `opencode.json`) — модели появятся в `/models`, можно переключать воркер через `/model`.
 
 В успешном smoke OpenCode должен реально вызвать `write`/`bash`, а не просто ответить текстом.
 

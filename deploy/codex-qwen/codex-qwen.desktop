@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Codex Qwen
+Comment=Codex Desktop using FreeQwenApi
+Exec=/path/to/codex-app/start-qwen.sh
+Icon=utilities-terminal
+Terminal=false
+Type=Application
+Categories=Development;
+StartupNotify=true

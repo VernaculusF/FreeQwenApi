@@ -1,0 +1,828 @@
+{
+  "models": [
+    {
+      "slug": "qwen3.8-max",
+      "display_name": "Qwen 3.8 Max",
+      "description": "Latest Qwen frontier model",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 1,
+      "context_window": 131072,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwen3.7-max",
+      "display_name": "Qwen 3.7 Max",
+      "description": "Qwen 3.7 maximum capability",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 2,
+      "context_window": 131072,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwen3.7-plus",
+      "display_name": "Qwen 3.7 Plus",
+      "description": "Balanced Qwen 3.7 model",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 3,
+      "context_window": 131072,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwen3-coder-plus",
+      "display_name": "Qwen 3 Coder Plus",
+      "description": "Qwen coding specialist",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 4,
+      "context_window": 131072,
+      "input_modalities": [
+        "text"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwen3.6-plus",
+      "display_name": "Qwen 3.6 Plus",
+      "description": "Balanced Qwen 3.6 model",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 5,
+      "context_window": 131072,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwen3.5-plus",
+      "display_name": "Qwen 3.5 Plus",
+      "description": "Balanced Qwen 3.5 model",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 6,
+      "context_window": 131072,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwen3.5-flash",
+      "display_name": "Qwen 3.5 Flash",
+      "description": "Fast Qwen 3.5 model",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 7,
+      "context_window": 131072,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwen3-max",
+      "display_name": "Qwen 3 Max",
+      "description": "Qwen 3 maximum capability",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 8,
+      "context_window": 131072,
+      "input_modalities": [
+        "text"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwen3-vl-plus",
+      "display_name": "Qwen 3 VL Plus",
+      "description": "Qwen multimodal model",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 9,
+      "context_window": 131072,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwen3-omni-flash",
+      "display_name": "Qwen 3 Omni Flash",
+      "description": "Fast multimodal Qwen model",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 10,
+      "context_window": 131072,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwen3.5-397b-a17b",
+      "display_name": "Qwen 3.5 397B A17B",
+      "description": "Large Qwen mixture-of-experts model",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 11,
+      "context_window": 131072,
+      "input_modalities": [
+        "text"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwen3.5-122b-a10b",
+      "display_name": "Qwen 3.5 122B A10B",
+      "description": "Qwen mixture-of-experts model",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 12,
+      "context_window": 131072,
+      "input_modalities": [
+        "text"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwen3.5-27b",
+      "display_name": "Qwen 3.5 27B",
+      "description": "Qwen dense model",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 13,
+      "context_window": 131072,
+      "input_modalities": [
+        "text"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwen3.5-35b-a3b",
+      "display_name": "Qwen 3.5 35B A3B",
+      "description": "Efficient Qwen mixture-of-experts model",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 14,
+      "context_window": 131072,
+      "input_modalities": [
+        "text"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwen3-omni-flash-2025-12-01",
+      "display_name": "Qwen 3 Omni Flash 2025-12-01",
+      "description": "Pinned Qwen Omni release",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 15,
+      "context_window": 131072,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwen-max-latest",
+      "display_name": "Qwen Max Latest",
+      "description": "Latest Qwen Max alias",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 16,
+      "context_window": 131072,
+      "input_modalities": [
+        "text"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwen-plus-2025-09-11",
+      "display_name": "Qwen Plus 2025-09-11",
+      "description": "Pinned Qwen Plus release",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 17,
+      "context_window": 131072,
+      "input_modalities": [
+        "text"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwen-plus-2025-01-25",
+      "display_name": "Qwen Plus 2025-01-25",
+      "description": "Pinned Qwen Plus release",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 18,
+      "context_window": 131072,
+      "input_modalities": [
+        "text"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwq-32b",
+      "display_name": "QwQ 32B",
+      "description": "Qwen reasoning model",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 19,
+      "context_window": 131072,
+      "input_modalities": [
+        "text"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwen3-235b-a22b",
+      "display_name": "Qwen 3 235B A22B",
+      "description": "Large Qwen mixture-of-experts model",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 20,
+      "context_window": 131072,
+      "input_modalities": [
+        "text"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwen3-30b-a3b",
+      "display_name": "Qwen 3 30B A3B",
+      "description": "Efficient Qwen mixture-of-experts model",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 21,
+      "context_window": 131072,
+      "input_modalities": [
+        "text"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwen3-coder-30b-a3b-instruct",
+      "display_name": "Qwen 3 Coder 30B A3B",
+      "description": "Qwen coding model",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 22,
+      "context_window": 131072,
+      "input_modalities": [
+        "text"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwen-turbo-2025-02-11",
+      "display_name": "Qwen Turbo 2025-02-11",
+      "description": "Fast pinned Qwen release",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 23,
+      "context_window": 131072,
+      "input_modalities": [
+        "text"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwen2.5-omni-7b",
+      "display_name": "Qwen 2.5 Omni 7B",
+      "description": "Compact multimodal Qwen model",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 24,
+      "context_window": 131072,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qvq-72b-preview-0310",
+      "display_name": "QVQ 72B Preview",
+      "description": "Visual reasoning preview model",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 25,
+      "context_window": 131072,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwen2.5-vl-32b-instruct",
+      "display_name": "Qwen 2.5 VL 32B",
+      "description": "Qwen vision-language model",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 26,
+      "context_window": 131072,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwen2.5-14b-instruct-1m",
+      "display_name": "Qwen 2.5 14B 1M",
+      "description": "Long-context Qwen model",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 27,
+      "context_window": 1048576,
+      "input_modalities": [
+        "text"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwen2.5-coder-32b-instruct",
+      "display_name": "Qwen 2.5 Coder 32B",
+      "description": "Qwen coding specialist",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 28,
+      "context_window": 131072,
+      "input_modalities": [
+        "text"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "qwen2.5-72b-instruct",
+      "display_name": "Qwen 2.5 72B",
+      "description": "Large Qwen instruction model",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "medium",
+          "description": "Default Qwen reasoning"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 29,
+      "context_window": 131072,
+      "input_modalities": [
+        "text"
+      ],
+      "base_instructions": "You are Codex, a pragmatic coding agent. Use the provided tools to inspect, modify, and verify the user workspace until the task is complete.",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": []
+    }
+  ]
+}
