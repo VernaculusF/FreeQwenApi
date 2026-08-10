@@ -18,6 +18,7 @@ import crypto from 'crypto';
 import { parseToolCallJson } from './toolParser.js';
 import { chatTranscriptStore, sequenceKeys } from './chatTranscript.js';
 import { listTokens, markInvalid, markRateLimited, markValid } from './tokenManager.js';
+import { buildStatelessTranscript } from '../utils/statelessTranscript.js';
 import { FORGETMEAI_WATERMARK } from '../utils/branding.js';
 import {
     canonicalizeConversationKey,
@@ -489,49 +490,7 @@ function parseOpenAIMessages(messages) {
 function buildCombinedTools(tools, functions, toolChoice) {
     const combinedTools = tools || (functions ? functions.map(fn => ({ type: 'function', function: fn })) : null);
     return { combinedTools, toolChoice };
-}
-
-function stringifyOpenAIContent(content) {
-    if (content === null || content === undefined) return '';
-    if (typeof content === 'string') return content;
-    if (Array.isArray(content)) {
-        return content.map(item => {
-            if (!item) return '';
-            if (typeof item === 'string') return item;
-            if (item.type === 'text') return item.text || '';
-            if (item.type === 'image_url') return `[image: ${item.image_url?.url || ''}]`;
-            if (item.type === 'image') return `[image: ${item.image || ''}]`;
-            if (item.type === 'file') return `[file: ${item.file || item.name || ''}]`;
-            return JSON.stringify(item);
-        }).filter(Boolean).join('\n');
-    }
-    return JSON.stringify(content);
-}
-
-function buildStatelessTranscript(messages) {
-    const parts = [];
-    for (const msg of messages || []) {
-        if (!msg || msg.role === 'system') continue;
-        if (msg.role === 'user') {
-            parts.push(`User: ${stringifyOpenAIContent(msg.content)}`);
-        } else if (msg.role === 'assistant') {
-            const text = stringifyOpenAIContent(msg.content);
-            if (text) parts.push(`Assistant: ${text}`);
-            if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
-                parts.push(`Assistant tool calls: ${JSON.stringify(msg.tool_calls)}`);
-            }
-        } else if (msg.role === 'tool') {
-            const name = msg.name || msg.tool_call_id || 'tool';
-            parts.push(`Tool result (${name}): ${stringifyOpenAIContent(msg.content)}`);
-        } else {
-            parts.push(`${msg.role || 'message'}: ${stringifyOpenAIContent(msg.content)}`);
-        }
-    }
-    return parts.join('\n\n');
-}
-
-
-function hasOpenAIToolState(messages) {
+}function hasOpenAIToolState(messages) {
     return (messages || []).some(msg =>
         msg?.role === 'tool' ||
         msg?.role === 'function' ||
